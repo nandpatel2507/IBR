@@ -1,1 +1,6 @@
-streamlityfinancepandasplotlystatsmodelsvaderSentiment
+streamlit
+yfinance
+pandas
+plotly
+statsmodels
+vaderSentiment
