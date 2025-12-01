@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 import numpy as np
-from textblob import TextBlob  # For Sentiment Analysis
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # Using VADER instead of TextBlob
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -45,14 +45,16 @@ def get_combined_data():
     
     try:
         # Download data
+        # auto_adjust=False ensures we get the raw columns we expect
         raw_data = yf.download(list(tickers.keys()), start=start_date, end=end_date, auto_adjust=False)
         
-        # Robust column selection
+        # Robust column selection (Handle cases where Adj Close might be missing)
         if 'Adj Close' in raw_data.columns:
             df = raw_data['Adj Close']
         elif 'Close' in raw_data.columns:
             df = raw_data['Close']
         else:
+            # Fallback
             return pd.DataFrame()
 
         df.rename(columns=tickers, inplace=True)
@@ -91,13 +93,12 @@ def get_combined_data():
 @st.cache_data(ttl=1800) # Cache news for 30 mins
 def get_live_sentiment(sector_name):
     # Map sectors to representative tickers for news fetching
-    # Nifty Indices don't always have news feeds, so we use major ETFs or stocks
     sector_map = {
         'Nifty 50': '^NSEI',
         'Nifty Bank': '^NSEBANK', 
-        'Nifty IT': 'INFY.NS',  # Infosys as proxy for IT news
-        'Nifty Auto': 'TATAMOTORS.NS', # Tata Motors as proxy
-        'Nifty Realty': 'DLF.NS' # DLF as proxy
+        'Nifty IT': 'INFY.NS',
+        'Nifty Auto': 'TATAMOTORS.NS',
+        'Nifty Realty': 'DLF.NS'
     }
     
     ticker_symbol = sector_map.get(sector_name, '^NSEI')
@@ -111,12 +112,16 @@ def get_live_sentiment(sector_name):
         sentiment_scores = []
         headlines = []
         
+        # Initialize VADER Analyzer
+        analyzer = SentimentIntensityAnalyzer()
+        
         for item in news:
             title = item.get('title', '')
             if title:
-                # Use TextBlob for simple polarity (-1 to 1)
-                analysis = TextBlob(title)
-                score = analysis.sentiment.polarity
+                # Calculate polarity score (Compound score ranges from -1 to 1)
+                vs = analyzer.polarity_scores(title)
+                score = vs['compound']
+                
                 sentiment_scores.append(score)
                 headlines.append(title)
         
@@ -126,8 +131,8 @@ def get_live_sentiment(sector_name):
         avg_score = sum(sentiment_scores) / len(sentiment_scores)
         
         # Scale score to match our -5 to +5 slider range
-        scaled_score = avg_score * 10  # -1 becomes -10, +1 becomes +10
-        # Clip to -5 to +5
+        scaled_score = avg_score * 5 
+        # Clip to ensure it stays within bounds
         scaled_score = max(min(scaled_score, 5), -5)
         
         return scaled_score, headlines[:3] # Return score and top 3 headlines
@@ -155,14 +160,14 @@ except Exception as e:
 # ==========================================
 tab1, tab2, tab3, tab4 = st.tabs(["🔮 Smart Prediction", "📉 Historical Impact", "📊 Sensitivity Analysis", "🔗 Correlation"])
 
-# --- TAB 1: SMART PREDICTION MODULE (UPDATED) ---
+# --- TAB 1: SMART PREDICTION MODULE ---
 with tab1:
     st.subheader("🤖 AI-Assisted Market Prediction (Next 5 Days)")
     st.markdown("""
-    This module predicts the 5-day trend using a **Hybrid Model**:
-    1.  **Live News Sentiment:** Automatically scans headlines to gauge market mood.
-    2.  **Interest Rate Shocks:** Calculates impact of manual rate changes.
-    3.  **Momentum:** Uses statistical trend lines.
+    This module projects the 5-day trend using:
+    1.  **Live News Sentiment:** Automated scan of headlines using VADER Analysis.
+    2.  **Interest Rate Shocks:** Impact of manual US/RBI rate scenarios.
+    3.  **Momentum:** Statistical trend lines.
     """)
     
     col_pred1, col_pred2 = st.columns([1, 2])
@@ -181,8 +186,11 @@ with tab1:
         st.metric("Live Sentiment Score", f"{auto_sentiment:.2f}", delta="Bullish" if auto_sentiment > 0 else "Bearish")
         
         with st.expander("See Recent Headlines Analyzed"):
-            for h in headlines:
-                st.caption(f"• {h}")
+            if isinstance(headlines, list):
+                for h in headlines:
+                    st.caption(f"• {h}")
+            else:
+                st.caption(headlines)
         
         # Allow Manual Override
         use_manual = st.checkbox("Override with Manual Sentiment?")
@@ -209,56 +217,59 @@ with tab1:
         
         # Trend
         recent_data = df[pred_sector].tail(30).dropna()
-        X_hist = np.arange(len(recent_data))
-        Y_hist = recent_data.values
-        coeffs = np.polyfit(X_hist, Y_hist, 1)
-        slope = coeffs[0]
-        
-        # Impacts
-        last_close = Y_hist[-1]
-        last_date = recent_data.index[-1]
-        
-        # Sentiment Impact (Price Adjustment per day)
-        sentiment_daily_impact = (last_close * 0.001) * final_sentiment 
-        
-        # Rate Impact (Total Shock)
-        total_rate_shock_pct = (beta_us * us_rate_change) + (beta_rbi * rbi_rate_change)
-        total_rate_price_shock = last_close * (total_rate_shock_pct / 100)
-        rate_daily_impact = total_rate_price_shock / 5
-        
-        # Generate Prediction
-        future_dates = [last_date + timedelta(days=i) for i in range(1, 8)]
-        future_dates = [d for d in future_dates if d.weekday() < 5][:5]
-        
-        pred_prices = []
-        current_pred = last_close
-        
-        for _ in range(5):
-            current_pred = current_pred + slope + sentiment_daily_impact + rate_daily_impact
-            pred_prices.append(current_pred)
+        if len(recent_data) > 10:
+            X_hist = np.arange(len(recent_data))
+            Y_hist = recent_data.values
+            coeffs = np.polyfit(X_hist, Y_hist, 1)
+            slope = coeffs[0]
             
-        # Visualization
-        hist_df = pd.DataFrame({'Date': recent_data.index, 'Price': Y_hist, 'Type': 'Actual History (30 Days)'})
-        pred_df = pd.DataFrame({'Date': future_dates, 'Price': pred_prices, 'Type': 'Predicted (Next 5 Days)'})
-        connect_row = pd.DataFrame({'Date': [recent_data.index[-1]], 'Price': [Y_hist[-1]], 'Type': 'Predicted (Next 5 Days)'})
-        pred_df = pd.concat([connect_row, pred_df])
-        full_df = pd.concat([hist_df, pred_df])
-        
-        fig_pred = px.line(full_df, x='Date', y='Price', color='Type',
-                           color_discrete_map={'Actual History (30 Days)': 'blue', 'Predicted (Next 5 Days)': 'green' if pred_prices[-1] > last_close else 'red'})
-        
-        fig_pred.update_layout(title=f"Forecast: {pred_sector} (Sentiment: {final_sentiment:.2f})", hovermode="x unified")
-        fig_pred.update_traces(patch={"line": {"dash": "dot", "width": 3}}, selector={"legendgroup": "Predicted (Next 5 Days)"})
-        
-        st.plotly_chart(fig_pred, use_container_width=True)
-        
-        final_pred = pred_prices[-1]
-        pct_change = ((final_pred - last_close) / last_close) * 100
-        
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Current Price", f"{last_close:,.2f}")
-        m2.metric("Predicted Price", f"{final_pred:,.2f}", f"{pct_change:.2f}%")
-        m3.info(f"**Rate Sensitivity:**\nUS Beta: {beta_us:.2f} | RBI Beta: {beta_rbi:.2f}")
+            # Impacts
+            last_close = Y_hist[-1]
+            last_date = recent_data.index[-1]
+            
+            # Sentiment Impact (Price Adjustment per day)
+            sentiment_daily_impact = (last_close * 0.001) * final_sentiment 
+            
+            # Rate Impact (Total Shock)
+            total_rate_shock_pct = (beta_us * us_rate_change) + (beta_rbi * rbi_rate_change)
+            total_rate_price_shock = last_close * (total_rate_shock_pct / 100)
+            rate_daily_impact = total_rate_price_shock / 5
+            
+            # Generate Prediction
+            future_dates = [last_date + timedelta(days=i) for i in range(1, 8)]
+            future_dates = [d for d in future_dates if d.weekday() < 5][:5]
+            
+            pred_prices = []
+            current_pred = last_close
+            
+            for _ in range(5):
+                current_pred = current_pred + slope + sentiment_daily_impact + rate_daily_impact
+                pred_prices.append(current_pred)
+                
+            # Visualization
+            hist_df = pd.DataFrame({'Date': recent_data.index, 'Price': Y_hist, 'Type': 'Actual History (30 Days)'})
+            pred_df = pd.DataFrame({'Date': future_dates, 'Price': pred_prices, 'Type': 'Predicted (Next 5 Days)'})
+            connect_row = pd.DataFrame({'Date': [recent_data.index[-1]], 'Price': [Y_hist[-1]], 'Type': 'Predicted (Next 5 Days)'})
+            pred_df = pd.concat([connect_row, pred_df])
+            full_df = pd.concat([hist_df, pred_df])
+            
+            fig_pred = px.line(full_df, x='Date', y='Price', color='Type',
+                               color_discrete_map={'Actual History (30 Days)': 'blue', 'Predicted (Next 5 Days)': 'green' if pred_prices[-1] > last_close else 'red'})
+            
+            fig_pred.update_layout(title=f"Forecast: {pred_sector} (Sentiment: {final_sentiment:.2f})", hovermode="x unified")
+            fig_pred.update_traces(patch={"line": {"dash": "dot", "width": 3}}, selector={"legendgroup": "Predicted (Next 5 Days)"})
+            
+            st.plotly_chart(fig_pred, use_container_width=True)
+            
+            final_pred = pred_prices[-1]
+            pct_change = ((final_pred - last_close) / last_close) * 100
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Current Price", f"{last_close:,.2f}")
+            m2.metric("Predicted Price", f"{final_pred:,.2f}", f"{pct_change:.2f}%")
+            m3.info(f"**Rate Sensitivity:**\nUS Beta: {beta_us:.2f} | RBI Beta: {beta_rbi:.2f}")
+        else:
+            st.error("Not enough data to generate prediction.")
 
 # --- TAB 2: HISTORICAL IMPACT ---
 with tab2:
