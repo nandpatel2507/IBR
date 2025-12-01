@@ -3,4 +3,4 @@ yfinance
 pandas
 plotly
 statsmodels
-pip install textblob
+textblob: pip install textblob
