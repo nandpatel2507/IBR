@@ -47,25 +47,47 @@ def get_data():
     end_date = datetime.now()
     start_date = end_date - timedelta(days=5*365)
     
-    # Download data
-    data = yf.download(list(tickers.keys()), start=start_date, end=end_date)['Adj Close']
-    
-    # Rename columns to friendly names
-    data.rename(columns=tickers, inplace=True)
-    
-    # Forward fill missing data (for holidays)
-    data = data.fillna(method='ffill')
-    
-    # Drop rows where all data is still NaN (start of dataframe)
-    data = data.dropna(how='all')
-    
-    return data
+    # Download data with error handling
+    try:
+        # auto_adjust=False ensures we get the raw columns we expect
+        raw_data = yf.download(list(tickers.keys()), start=start_date, end=end_date, auto_adjust=False)
+        
+        # Robust column selection (Handle cases where Adj Close might be missing)
+        if 'Adj Close' in raw_data.columns:
+            data = raw_data['Adj Close']
+        elif 'Close' in raw_data.columns:
+            data = raw_data['Close']
+        else:
+            # If structure is different, try to return as is or return empty
+            return pd.DataFrame()
+
+        # Rename columns to friendly names
+        data.rename(columns=tickers, inplace=True)
+        
+        # Forward fill missing data (for holidays)
+        data = data.fillna(method='ffill')
+        
+        # Drop rows where all data is still NaN (start of dataframe)
+        data = data.dropna(how='all')
+        
+        return data
+
+    except Exception as e:
+        st.error(f"Failed to download data: {e}")
+        return pd.DataFrame()
 
 # Load Data
 try:
     with st.spinner('Fetching live market data...'):
         df = get_data()
+    
+    # --- CRITICAL FIX: Check if data is empty before accessing it ---
+    if df is None or df.empty:
+        st.error("⚠️ No data could be retrieved. This may be due to a connection issue with Yahoo Finance. Please refresh the page in a few moments.")
+        st.stop()
+        
     st.success(f"Data updated successfully! Last date: {df.index[-1].strftime('%Y-%m-%d')}")
+
 except Exception as e:
     st.error(f"Error fetching data: {e}")
     st.stop()
@@ -87,9 +109,14 @@ st.subheader("Market Snapshot (Latest Close)")
 col1, col2, col3, col4 = st.columns(4)
 
 def get_change(series):
+    # Safe check for empty series
+    clean_series = series.dropna()
+    if len(clean_series) < 2:
+        return 0, 0
+        
     # Get last valid value
-    latest = series.dropna().iloc[-1]
-    prev = series.dropna().iloc[-2]
+    latest = clean_series.iloc[-1]
+    prev = clean_series.iloc[-2]
     change = ((latest - prev) / prev) * 100
     return latest, change
 
@@ -188,12 +215,6 @@ with tab3:
     r_squared = model.rsquared
     
     # Prediction Calculation
-    # Note: Beta from daily returns is small. To simulate a "shock" scenario, we scale it.
-    # If Yields move by 1% (relative), Stocks move by Beta * 1%.
-    # But users usually think in absolute bps (e.g. +50bps).
-    # Simplified logic: Impact = Beta * (Rate Shock / Average Yield) * Scale
-    # For robust simulation: Impact = Beta * Rate Shock
-    
     impact_prediction = beta * rate_shock
     
     with col_sim2:
