@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import statsmodels.api as sm
 import numpy as np
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer # Using VADER instead of TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -44,21 +44,19 @@ def get_combined_data():
     start_date = end_date - timedelta(days=15*365) # 15 Years of data
     
     try:
-        # Download data
-        # auto_adjust=False ensures we get the raw columns we expect
         raw_data = yf.download(list(tickers.keys()), start=start_date, end=end_date, auto_adjust=False)
         
-        # Robust column selection (Handle cases where Adj Close might be missing)
         if 'Adj Close' in raw_data.columns:
             df = raw_data['Adj Close']
         elif 'Close' in raw_data.columns:
             df = raw_data['Close']
         else:
-            # Fallback
             return pd.DataFrame()
 
         df.rename(columns=tickers, inplace=True)
+        # Handle weekends/holidays in market data first
         df = df.fillna(method='ffill')
+        
     except Exception as e:
         st.error(f"Error fetching Yahoo data: {e}")
         return pd.DataFrame()
@@ -78,21 +76,29 @@ def get_combined_data():
         ('2022-08-05', 5.40), ('2022-09-30', 5.90), ('2022-12-07', 6.25), ('2023-02-08', 6.50)
     ]
     
-    rbi_series = pd.Series(np.nan, index=df.index)
-    for date_str, rate in rbi_history:
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        if date_obj in rbi_series.index:
-            rbi_series.loc[date_obj] = rate
+    # Improved Logic: Create a DataFrame for Rates and Reindex it to match Market Data
+    # This handles non-trading days (Sat/Sun) where a rate change might have occurred
+    rbi_dates = [datetime.strptime(x[0], '%Y-%m-%d') for x in rbi_history]
+    rbi_rates = [x[1] for x in rbi_history]
     
-    df['RBI Repo Rate'] = rbi_series.ffill()
+    rbi_df = pd.DataFrame({'Rate': rbi_rates}, index=rbi_dates)
+    rbi_df = rbi_df.sort_index()
+    
+    # Reindex RBI data to match the Stock Market dataframe index
+    # method='ffill' propagates the last known rate forward to all trading days
+    aligned_rbi = rbi_df.reindex(df.index, method='ffill')
+    
+    # Assign to main dataframe
+    df['RBI Repo Rate'] = aligned_rbi['Rate']
+    
+    # Fill any initial gaps (before 2010 if any) with the first available rate
     df['RBI Repo Rate'] = df['RBI Repo Rate'].bfill()
     
     return df
 
 # --- C. LIVE NEWS SENTIMENT FUNCTION ---
-@st.cache_data(ttl=1800) # Cache news for 30 mins
+@st.cache_data(ttl=1800) 
 def get_live_sentiment(sector_name):
-    # Map sectors to representative tickers for news fetching
     sector_map = {
         'Nifty 50': '^NSEI',
         'Nifty Bank': '^NSEBANK', 
@@ -111,17 +117,12 @@ def get_live_sentiment(sector_name):
             
         sentiment_scores = []
         headlines = []
-        
-        # Initialize VADER Analyzer
         analyzer = SentimentIntensityAnalyzer()
         
         for item in news:
             title = item.get('title', '')
             if title:
-                # Calculate polarity score (Compound score ranges from -1 to 1)
-                vs = analyzer.polarity_scores(title)
-                score = vs['compound']
-                
+                score = analyzer.polarity_scores(title)['compound']
                 sentiment_scores.append(score)
                 headlines.append(title)
         
@@ -129,13 +130,10 @@ def get_live_sentiment(sector_name):
             return 0, "No readable text."
             
         avg_score = sum(sentiment_scores) / len(sentiment_scores)
-        
-        # Scale score to match our -5 to +5 slider range
         scaled_score = avg_score * 5 
-        # Clip to ensure it stays within bounds
         scaled_score = max(min(scaled_score, 5), -5)
         
-        return scaled_score, headlines[:3] # Return score and top 3 headlines
+        return scaled_score, headlines[:3]
         
     except Exception as e:
         return 0, f"Error fetching news: {str(e)}"
@@ -163,12 +161,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["🔮 Smart Prediction", "📉 Historical Impa
 # --- TAB 1: SMART PREDICTION MODULE ---
 with tab1:
     st.subheader("🤖 AI-Assisted Market Prediction (Next 5 Days)")
-    st.markdown("""
-    This module projects the 5-day trend using:
-    1.  **Live News Sentiment:** Automated scan of headlines using VADER Analysis.
-    2.  **Interest Rate Shocks:** Impact of manual US/RBI rate scenarios.
-    3.  **Momentum:** Statistical trend lines.
-    """)
+    st.markdown("Predict trends using Live Sentiment + Rate Shocks + Momentum.")
     
     col_pred1, col_pred2 = st.columns([1, 2])
     
@@ -179,7 +172,6 @@ with tab1:
         st.markdown("---")
         st.markdown("### 2. Live Sentiment Analysis")
         
-        # Fetch Live Sentiment
         with st.spinner(f"Scanning news for {pred_sector}..."):
             auto_sentiment, headlines = get_live_sentiment(pred_sector)
             
@@ -192,7 +184,6 @@ with tab1:
             else:
                 st.caption(headlines)
         
-        # Allow Manual Override
         use_manual = st.checkbox("Override with Manual Sentiment?")
         if use_manual:
             final_sentiment = st.slider("Manual Score:", -5.0, 5.0, 0.0)
@@ -205,71 +196,84 @@ with tab1:
         rbi_rate_change = st.number_input("🇮🇳 RBI Rate Change (%)", min_value=-2.0, max_value=2.0, value=0.00, step=0.05)
         
     with col_pred2:
-        # --- MODEL LOGIC ---
-        df_calc = df.tail(365*5).pct_change().dropna()
-        Y_calc = df_calc[pred_sector]
-        X_calc = df_calc[['US 10Y Bond Yield', 'RBI Repo Rate']]
-        X_calc = sm.add_constant(X_calc)
+        # --- ROBUST MODEL LOGIC ---
+        # 1. Prepare Data
+        df_calc = df.tail(365*5).pct_change()
         
-        model = sm.OLS(Y_calc, X_calc).fit()
-        beta_us = model.params['US 10Y Bond Yield']
-        beta_rbi = model.params['RBI Repo Rate']
+        # 2. Clean Data (Handle Infinite values from % change calculation)
+        df_calc = df_calc.replace([np.inf, -np.inf], np.nan).dropna()
         
-        # Trend
-        recent_data = df[pred_sector].tail(30).dropna()
-        if len(recent_data) > 10:
-            X_hist = np.arange(len(recent_data))
-            Y_hist = recent_data.values
-            coeffs = np.polyfit(X_hist, Y_hist, 1)
-            slope = coeffs[0]
-            
-            # Impacts
-            last_close = Y_hist[-1]
-            last_date = recent_data.index[-1]
-            
-            # Sentiment Impact (Price Adjustment per day)
-            sentiment_daily_impact = (last_close * 0.001) * final_sentiment 
-            
-            # Rate Impact (Total Shock)
-            total_rate_shock_pct = (beta_us * us_rate_change) + (beta_rbi * rbi_rate_change)
-            total_rate_price_shock = last_close * (total_rate_shock_pct / 100)
-            rate_daily_impact = total_rate_price_shock / 5
-            
-            # Generate Prediction
-            future_dates = [last_date + timedelta(days=i) for i in range(1, 8)]
-            future_dates = [d for d in future_dates if d.weekday() < 5][:5]
-            
-            pred_prices = []
-            current_pred = last_close
-            
-            for _ in range(5):
-                current_pred = current_pred + slope + sentiment_daily_impact + rate_daily_impact
-                pred_prices.append(current_pred)
-                
-            # Visualization
-            hist_df = pd.DataFrame({'Date': recent_data.index, 'Price': Y_hist, 'Type': 'Actual History (30 Days)'})
-            pred_df = pd.DataFrame({'Date': future_dates, 'Price': pred_prices, 'Type': 'Predicted (Next 5 Days)'})
-            connect_row = pd.DataFrame({'Date': [recent_data.index[-1]], 'Price': [Y_hist[-1]], 'Type': 'Predicted (Next 5 Days)'})
-            pred_df = pd.concat([connect_row, pred_df])
-            full_df = pd.concat([hist_df, pred_df])
-            
-            fig_pred = px.line(full_df, x='Date', y='Price', color='Type',
-                               color_discrete_map={'Actual History (30 Days)': 'blue', 'Predicted (Next 5 Days)': 'green' if pred_prices[-1] > last_close else 'red'})
-            
-            fig_pred.update_layout(title=f"Forecast: {pred_sector} (Sentiment: {final_sentiment:.2f})", hovermode="x unified")
-            fig_pred.update_traces(patch={"line": {"dash": "dot", "width": 3}}, selector={"legendgroup": "Predicted (Next 5 Days)"})
-            
-            st.plotly_chart(fig_pred, use_container_width=True)
-            
-            final_pred = pred_prices[-1]
-            pct_change = ((final_pred - last_close) / last_close) * 100
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Current Price", f"{last_close:,.2f}")
-            m2.metric("Predicted Price", f"{final_pred:,.2f}", f"{pct_change:.2f}%")
-            m3.info(f"**Rate Sensitivity:**\nUS Beta: {beta_us:.2f} | RBI Beta: {beta_rbi:.2f}")
+        # 3. Check for sufficient data
+        if len(df_calc) < 30:
+            st.error("Insufficient data for regression analysis. Please try again later.")
         else:
-            st.error("Not enough data to generate prediction.")
+            Y_calc = df_calc[pred_sector]
+            X_calc = df_calc[['US 10Y Bond Yield', 'RBI Repo Rate']]
+            
+            # Ensure strictly float types
+            Y_calc = Y_calc.astype(float)
+            X_calc = X_calc.astype(float)
+            
+            X_calc = sm.add_constant(X_calc)
+            
+            try:
+                model = sm.OLS(Y_calc, X_calc).fit()
+                beta_us = model.params['US 10Y Bond Yield']
+                beta_rbi = model.params['RBI Repo Rate']
+                
+                # Trend Logic
+                recent_data = df[pred_sector].tail(30).dropna()
+                if len(recent_data) > 10:
+                    X_hist = np.arange(len(recent_data))
+                    Y_hist = recent_data.values.astype(float)
+                    coeffs = np.polyfit(X_hist, Y_hist, 1)
+                    slope = coeffs[0]
+                    
+                    last_close = Y_hist[-1]
+                    last_date = recent_data.index[-1]
+                    
+                    sentiment_daily_impact = (last_close * 0.001) * final_sentiment 
+                    
+                    total_rate_shock_pct = (beta_us * us_rate_change) + (beta_rbi * rbi_rate_change)
+                    total_rate_price_shock = last_close * (total_rate_shock_pct / 100)
+                    rate_daily_impact = total_rate_price_shock / 5
+                    
+                    future_dates = [last_date + timedelta(days=i) for i in range(1, 8)]
+                    future_dates = [d for d in future_dates if d.weekday() < 5][:5]
+                    
+                    pred_prices = []
+                    current_pred = last_close
+                    
+                    for _ in range(5):
+                        current_pred = current_pred + slope + sentiment_daily_impact + rate_daily_impact
+                        pred_prices.append(current_pred)
+                        
+                    # Visualization
+                    hist_df = pd.DataFrame({'Date': recent_data.index, 'Price': Y_hist, 'Type': 'Actual History (30 Days)'})
+                    pred_df = pd.DataFrame({'Date': future_dates, 'Price': pred_prices, 'Type': 'Predicted (Next 5 Days)'})
+                    connect_row = pd.DataFrame({'Date': [recent_data.index[-1]], 'Price': [Y_hist[-1]], 'Type': 'Predicted (Next 5 Days)'})
+                    pred_df = pd.concat([connect_row, pred_df])
+                    full_df = pd.concat([hist_df, pred_df])
+                    
+                    fig_pred = px.line(full_df, x='Date', y='Price', color='Type',
+                                    color_discrete_map={'Actual History (30 Days)': 'blue', 'Predicted (Next 5 Days)': 'green' if pred_prices[-1] > last_close else 'red'})
+                    
+                    fig_pred.update_layout(title=f"Forecast: {pred_sector} (Sentiment: {final_sentiment:.2f})", hovermode="x unified")
+                    fig_pred.update_traces(patch={"line": {"dash": "dot", "width": 3}}, selector={"legendgroup": "Predicted (Next 5 Days)"})
+                    
+                    st.plotly_chart(fig_pred, use_container_width=True)
+                    
+                    final_pred = pred_prices[-1]
+                    pct_change = ((final_pred - last_close) / last_close) * 100
+                    
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Current Price", f"{last_close:,.2f}")
+                    m2.metric("Predicted Price", f"{final_pred:,.2f}", f"{pct_change:.2f}%")
+                    m3.info(f"**Rate Sensitivity:**\nUS Beta: {beta_us:.2f} | RBI Beta: {beta_rbi:.2f}")
+                else:
+                    st.error("Not enough recent data to generate prediction.")
+            except Exception as e:
+                st.error(f"Modeling Error: {e}")
 
 # --- TAB 2: HISTORICAL IMPACT ---
 with tab2:
@@ -298,33 +302,41 @@ with tab3:
     with col_s1:
         target_sector_s = st.selectbox("Select Target Sector:", ['Nifty Bank', 'Nifty IT', 'Nifty Realty', 'Nifty Auto'], key='sens_sector')
     
-    df_analysis = df.tail(365*5).copy()
-    returns = df_analysis.pct_change().dropna()
-    Y = returns[target_sector_s]
-    X = returns[['US 10Y Bond Yield', 'RBI Repo Rate']]
-    X = sm.add_constant(X)
-    model = sm.OLS(Y, X).fit()
-    beta_us_s = model.params['US 10Y Bond Yield']
-    beta_rbi_s = model.params['RBI Repo Rate']
+    # Robust data cleaning here too
+    df_analysis = df.tail(365*5).pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     
-    with col_s2:
-        st.write("") 
-        if abs(beta_us_s) > abs(beta_rbi_s):
-            st.warning(f"⚠️ {target_sector_s} is more sensitive to **US Rates** ({beta_us_s:.2f}) than RBI Rates.")
-        else:
-            st.success(f"🛡️ {target_sector_s} is driven more by **Domestic RBI Rates** ({beta_rbi_s:.2f}).")
+    if len(df_analysis) > 30:
+        Y = df_analysis[target_sector_s]
+        X = df_analysis[['US 10Y Bond Yield', 'RBI Repo Rate']]
+        X = sm.add_constant(X)
+        model = sm.OLS(Y, X).fit()
+        beta_us_s = model.params['US 10Y Bond Yield']
+        beta_rbi_s = model.params['RBI Repo Rate']
+        
+        with col_s2:
+            st.write("") 
+            if abs(beta_us_s) > abs(beta_rbi_s):
+                st.warning(f"⚠️ {target_sector_s} is more sensitive to **US Rates** ({beta_us_s:.2f}) than RBI Rates.")
+            else:
+                st.success(f"🛡️ {target_sector_s} is driven more by **Domestic RBI Rates** ({beta_rbi_s:.2f}).")
 
-    beta_df = pd.DataFrame({
-        'Factor': ['US 10Y Yield', 'RBI Repo Rate'],
-        'Sensitivity (Beta)': [beta_us_s, beta_rbi_s]
-    })
-    fig_bar = px.bar(beta_df, x='Factor', y='Sensitivity (Beta)', color='Sensitivity (Beta)', color_continuous_scale='RdBu_r')
-    st.plotly_chart(fig_bar, use_container_width=True)
+        beta_df = pd.DataFrame({
+            'Factor': ['US 10Y Yield', 'RBI Repo Rate'],
+            'Sensitivity (Beta)': [beta_us_s, beta_rbi_s]
+        })
+        fig_bar = px.bar(beta_df, x='Factor', y='Sensitivity (Beta)', color='Sensitivity (Beta)', color_continuous_scale='RdBu_r')
+        st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.error("Insufficient data for sensitivity analysis.")
 
 # --- TAB 4: CORRELATION ---
 with tab4:
     st.subheader("Correlation Matrix")
-    returns_corr = df.pct_change().dropna()
+    returns_corr = df.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     cols_to_corr = ['RBI Repo Rate', 'US 10Y Bond Yield', 'USD/INR', 'Nifty 50', 'Nifty Bank', 'Nifty IT']
-    fig_corr = px.imshow(returns_corr[cols_to_corr].corr(), text_auto=True, color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+    
+    # Ensure columns exist
+    valid_cols = [c for c in cols_to_corr if c in returns_corr.columns]
+    
+    fig_corr = px.imshow(returns_corr[valid_cols].corr(), text_auto=True, color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
     st.plotly_chart(fig_corr, use_container_width=True)
