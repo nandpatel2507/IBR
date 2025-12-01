@@ -1,1 +1,5 @@
-streamlityfinancepandasplotlystatsmodelsscipy
+streamlit
+yfinance
+pandas
+plotly
+statsmodels
