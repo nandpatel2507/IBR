@@ -1,6 +1,1 @@
-streamlit
-yfinance
-pandas
-plotly
-statsmodels
-textblob: pip install textblob
+streamlityfinancepandasplotlystatsmodelsvaderSentiment
