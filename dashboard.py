@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for Professional UI
+# Custom CSS
 st.markdown("""
     <style>
     .metric-container {
@@ -41,7 +41,7 @@ try:
 except LookupError:
     nltk.download('vader_lexicon')
 
-# --- 2. DATA UNIVERSE (Verified 2025 Tickers) ---
+# --- 2. DATA UNIVERSE ---
 INDICES = {
     "NIFTY 50": "^NSEI",
     "NIFTY BANK": "^NSEBANK",
@@ -86,34 +86,29 @@ NEWS_FEEDS = [
     "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"
 ]
 
-# --- 3. MARKET STATUS LOGIC ---
+# --- 3. LOGIC ---
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     if now.weekday() < 5 and (time(9,15) <= now.time() <= time(15,30)):
-        return True, "🟢 MARKET LIVE", 60 # 60s Refresh
-    return False, "🔴 MARKET CLOSED", 300 # 5m Refresh
+        return True, "🟢 MARKET LIVE", 60 
+    return False, "🔴 MARKET CLOSED", 300
 
-# --- 4. ANALYTICS ENGINE ---
+# --- 4. CORE FUNCTIONS (With Optimized Caching) ---
 
 @st.cache_data(ttl=300)
 def fetch_data_package(ticker):
     stock = yf.Ticker(ticker)
-    
-    # 1. Historical Data (2 Years)
     hist_daily = stock.history(period="2y", interval="1d")
-    
-    # 2. Intraday Data (1 Day)
     hist_intraday = stock.history(period="1d", interval="5m")
     
-    # 3. Bollinger Bands
+    # Bollinger Bands
     if not hist_daily.empty:
         hist_daily['SMA20'] = hist_daily['Close'].rolling(window=20).mean()
         hist_daily['STD20'] = hist_daily['Close'].rolling(window=20).std()
         hist_daily['Upper'] = hist_daily['SMA20'] + (hist_daily['STD20'] * 2)
         hist_daily['Lower'] = hist_daily['SMA20'] - (hist_daily['STD20'] * 2)
 
-    # 4. Info Metrics (Safe Fetch)
     try:
         info = stock.info
         todays_open = info.get('open', hist_daily['Open'].iloc[-1])
@@ -128,31 +123,58 @@ def fetch_data_package(ticker):
         
     return hist_daily, hist_intraday, todays_open, prev_close, day_high, day_low
 
-@st.cache_data(ttl=1800) 
+@st.cache_data(ttl=3600) # Cache for 1 hour to prevent spinner hang
+def fetch_movers_data(const_tickers):
+    """Heavy batch fetch - strictly cached"""
+    try:
+        # threads=False prevents hanging on Streamlit Cloud
+        data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False, threads=False)
+        
+        table_data = []
+        for t in const_tickers:
+            try:
+                if len(const_tickers) == 1: df_t = data
+                else: 
+                    if t not in data.columns.levels[0]: continue
+                    df_t = data[t]
+                
+                if len(df_t) < 2: continue
+                latest = df_t['Close'].iloc[-1]
+                prev = df_t['Close'].iloc[-2]
+                
+                if pd.isna(latest) or prev == 0: continue
+                
+                chg_pct = ((latest - prev) / prev) * 100
+                table_data.append({
+                    "Company": t.replace(".NS","").replace(".BO",""),
+                    "Price": latest,
+                    "Change %": chg_pct,
+                    "Trend": "🟢" if chg_pct > 0 else "🔴"
+                })
+            except: continue
+        return pd.DataFrame(table_data)
+    except:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=1800)
 def get_option_chain_pcr(ticker):
-    """Calculates Put-Call Ratio (PCR) from Option Chain"""
     try:
         stock = yf.Ticker(ticker)
         exps = stock.options
-        if not exps: return 1.0 # Default
-        
-        # Fetch nearest expiry
+        if not exps: return 1.0
         opt = stock.option_chain(exps[0])
         calls_vol = opt.calls['volume'].sum()
         puts_vol = opt.puts['volume'].sum()
-        
         if calls_vol == 0: return 1.0
         return puts_vol / calls_vol
     except:
         return 1.0
 
 def get_fii_proxy():
-    """Uses USD/INR trend as a proxy for Foreign Money Flow"""
     try:
         data = yf.download("INR=X", period="5d", progress=False)['Close']
-        if isinstance(data, pd.DataFrame): data = data.iloc[:, 0] # Handle multi-index
+        if isinstance(data, pd.DataFrame): data = data.iloc[:, 0]
         trend = (data.iloc[-1] - data.iloc[0])
-        # USD UP = Rupee Weak = FII Selling
         return "SELLING 🔻" if trend > 0 else "BUYING 🟢"
     except:
         return "NEUTRAL ⚪"
@@ -160,8 +182,6 @@ def get_fii_proxy():
 def get_hybrid_sentiment():
     sia = SentimentIntensityAnalyzer()
     articles = []
-    
-    # News Sentiment
     for feed in NEWS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
@@ -174,12 +194,10 @@ def get_hybrid_sentiment():
         scores = [sia.polarity_scores(a)['compound'] for a in articles]
         news_score = np.mean(scores)
     
-    # VIX (Fear) Sentiment
     try:
         vix_data = yf.download("^INDIAVIX", period="5d", progress=False)['Close']
         if isinstance(vix_data, pd.DataFrame): vix_data = vix_data.iloc[:, 0]
         current_vix = vix_data.iloc[-1]
-        # VIX Impact: High VIX (>15) = Fear (-ve score)
         vix_impact = -1 * ((current_vix - 15) / 10) 
         vix_impact = max(min(vix_impact, 1.0), -1.0) 
     except:
@@ -189,8 +207,7 @@ def get_hybrid_sentiment():
     final_score = (news_score * 0.5) + (vix_impact * 0.5)
     return final_score, articles[:3], current_vix
 
-# --- 5. MAIN DASHBOARD UI ---
-
+# --- 5. MAIN APP ---
 if 'last_run' not in st.session_state: st.session_state['last_run'] = 0
 
 is_open, status_msg, refresh_rate = get_market_status()
@@ -200,17 +217,17 @@ st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 st.sidebar.markdown(f"**Status:** {status_msg}")
-st.sidebar.caption(f"Refresh Rate: {refresh_rate}s")
+st.sidebar.caption(f"Refresh: {refresh_rate}s")
 
-# FETCH ALL DATA
+# Fetch Data
 hist_daily, hist_intraday, open_p, prev_close, high_p, low_p = fetch_data_package(ticker)
 current_price = hist_daily['Close'].iloc[-1]
 sentiment_score, headlines, current_vix = get_hybrid_sentiment()
 fii_status = get_fii_proxy()
 pcr_value = get_option_chain_pcr(ticker)
 
-# PREDICTION ENGINE
-pcr_bias = (pcr_value - 1) * 0.005 # PCR Bias
+# Prediction Logic
+pcr_bias = (pcr_value - 1) * 0.005
 predicted_change = (sentiment_score * 0.015) + pcr_bias
 
 if is_open:
@@ -221,15 +238,13 @@ else:
     gap = sentiment_score * 0.015 
     predicted_value = current_price * (1 + gap)
 
-# --- DASHBOARD LAYOUT ---
-
-# Header
+# --- LAYOUT ---
 c1, c2 = st.columns([3, 1])
 with c1:
     st.title(f"{selected_index} Command Center")
     st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')} • {status_msg}")
 
-# Top Metrics Row
+# Metrics
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1: st.metric("Current Price", f"₹{current_price:,.2f}", delta=f"{((current_price-prev_close)/prev_close)*100:.2f}%")
 with m2: st.metric("Today's Open", f"₹{open_p:,.2f}", delta=f"{((open_p-prev_close)/prev_close)*100:.2f}%", delta_color="off")
@@ -241,14 +256,13 @@ with m5:
 
 st.divider()
 
-# Charts & Signals
+# Charts
 g1, g2 = st.columns([3, 1])
 
 with g1:
     st.subheader("Market Trends")
     tab_intra, tab_hist = st.tabs(["⏱️ Today (Live)", "📅 Historical + Bollinger"])
     
-    # 1. Intraday Chart
     with tab_intra:
         if not hist_intraday.empty:
             fig_intra = go.Figure()
@@ -256,9 +270,8 @@ with g1:
                 x=hist_intraday.index,
                 open=hist_intraday['Open'], high=hist_intraday['High'],
                 low=hist_intraday['Low'], close=hist_intraday['Close'],
-                name='Price'
+                name='Live'
             ))
-            # AI Trajectory Line
             last_time = hist_intraday.index[-1]
             fig_intra.add_trace(go.Scatter(
                 x=[last_time, last_time + timedelta(hours=1)],
@@ -271,11 +284,8 @@ with g1:
         else:
             st.warning("No intraday data available.")
 
-    # 2. Historical Chart
     with tab_hist:
         show_bb = st.checkbox("Show Bollinger Bands", value=False)
-        
-        # Prediction & Cloud Prep
         future_dates = [hist_daily.index[-1] + timedelta(days=i) for i in range(1, 6)]
         future_prices = [current_price]
         for _ in range(5):
@@ -310,74 +320,35 @@ with g1:
             dict(count=1, label="1Y", step="year", stepmode="backward"),
             dict(step="all", label="MAX")
         ]), bgcolor="#262730"))
-        
         fig_hist.update_layout(height=420, template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig_hist, use_container_width=True)
 
 with g2:
-    st.subheader("Advanced Signals")
+    st.subheader("Smart Signals")
     st.metric("FII Proxy (USD/INR)", fii_status, delta="Flow Direction", delta_color="off")
-    
     pcr_col = "normal" if pcr_value > 1 else "inverse"
     st.metric("Put-Call Ratio (PCR)", f"{pcr_value:.2f}", delta=">1 Bullish / <0.7 Bearish", delta_color=pcr_col)
-    
     st.metric("India VIX", f"{current_vix:.2f}", delta="Fear Index", delta_color="inverse")
-    
     st.divider()
     st.caption("AI News Scanner:")
     for h in headlines: st.write(f"• {h}")
 
 st.divider()
 
-# --- CONSTITUENTS SECTION ---
+# Constituents (Cached & Safe)
 st.subheader(f"🏗️ {selected_index} Movers (Live)")
 const_tickers = CONSTITUENTS[selected_index]
+# This call is now CACHED for 1 hour so it won't spin forever
+df_movers = fetch_movers_data(const_tickers)
 
-try:
-    # Batch fetch for speed
-    data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False, threads=True)
-    
-    table_data = []
-    for t in const_tickers:
-        try:
-            # Handle Single vs Multi Index Data Structure
-            if len(const_tickers) == 1: df_t = data
-            else: 
-                if t not in data.columns.levels[0]: continue
-                df_t = data[t]
-            
-            if len(df_t) < 2: continue
-            
-            latest = df_t['Close'].iloc[-1]
-            prev = df_t['Close'].iloc[-2]
-            
-            if pd.isna(latest) or pd.isna(prev) or prev == 0: continue
-            
-            chg_pct = ((latest - prev) / prev) * 100
-            table_data.append({
-                "Company": t.replace(".NS","").replace(".BO",""),
-                "Price": latest,
-                "Change %": chg_pct,
-                "Trend": "🟢" if chg_pct > 0 else "🔴"
-            })
-        except: continue
+if not df_movers.empty:
+    t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
+    col_conf = {"Price": st.column_config.NumberColumn(format="₹%.2f"), "Change %": st.column_config.NumberColumn(format="%.2f%%")}
+    with t1: st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t2: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t3: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+else:
+    st.warning("⚠️ Market data unavailable or connection timed out.")
 
-    if table_data:
-        df_movers = pd.DataFrame(table_data)
-        t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
-        
-        col_conf = {
-            "Price": st.column_config.NumberColumn(format="₹%.2f"),
-            "Change %": st.column_config.NumberColumn(format="%.2f%%")
-        }
-        
-        with t1: st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
-        with t2: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
-        with t3: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
-
-except Exception as e:
-    st.warning("Data fetch busy. Retrying in next cycle.")
-
-# Auto-Refresh
 time_module.sleep(refresh_rate)
 st.rerun()
