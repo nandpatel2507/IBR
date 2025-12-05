@@ -334,34 +334,73 @@ with g2:
 
 st.divider()
 
-# CONSTITUENTS
-st.subheader(f"🏗️ {selected_index} Movers")
-const_tickers = CONSTITUENTS[selected_index]
-data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False)
+# --- REPLACEMENT FOR THE BOTTOM 'CONSTITUENTS' SECTION ---
+st.subheader(f"🏗️ {selected_index} Movers (Live)")
+st.caption("Tracking all index constituents. Prices delayed by ~1-2 mins.")
 
-table_data = []
-for t in const_tickers:
-    try:
-        if t in data.columns.levels[0]:
-            df_t = data[t]
+const_tickers = CONSTITUENTS[selected_index]
+
+# SAFE BATCH FETCH
+try:
+    # Fetch 2 days of data to calculate change
+    data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False, threads=True)
+    
+    table_data = []
+    for t in const_tickers:
+        try:
+            # Handle Single Ticker vs Multi-Index formatting issues
+            if len(const_tickers) == 1:
+                df_t = data
+            else:
+                if t not in data.columns.levels[0]: continue # Skip if download failed
+                df_t = data[t]
+
+            # Check if we have enough data (at least 2 rows)
+            if len(df_t) < 2: continue
+
             latest = df_t['Close'].iloc[-1]
             prev = df_t['Close'].iloc[-2]
+            
+            # Avoid division by zero
+            if prev == 0: continue
+            
             chg_pct = ((latest - prev) / prev) * 100
+            
             table_data.append({
                 "Company": t.replace(".NS", "").replace(".BO", ""),
                 "Price": latest,
                 "Change %": chg_pct,
                 "Trend": "🟢" if chg_pct > 0 else "🔴"
             })
-    except: continue
+        except Exception as e:
+            continue # Skip bad tickers silently
 
-if table_data:
-    df_movers = pd.DataFrame(table_data)
-    t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
-    col_conf = {"Price": st.column_config.NumberColumn(format="₹%.2f"), "Change %": st.column_config.NumberColumn(format="%.2f%%")}
-    with t1: st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
-    with t2: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
-    with t3: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+    if table_data:
+        df_movers = pd.DataFrame(table_data)
+        
+        t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
+        
+        col_conf = {
+            "Price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Change %": st.column_config.NumberColumn(format="%.2f%%"),
+        }
+        
+        with t1:
+            st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
+        with t2:
+            st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+        with t3:
+            st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+    else:
+        st.warning("⚠️ Could not fetch constituent data. Yahoo Finance API might be busy.")
 
+except Exception as e:
+    st.error(f"Data Connection Error: {e}")
+
+# Footer
+st.markdown("---")
+st.caption("Powered by AI & Python • Data: Yahoo Finance (Delayed) • Sentiment: NLTK Analysis")
+
+# Auto Refresh Logic
 time_module.sleep(refresh_rate)
 st.rerun()
