@@ -4,3 +4,5 @@ pandas
 numpy
 plotly
 scikit-learn
+feedparser
+nltk
