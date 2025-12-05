@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for "Sleep Mode" and Metrics
+# Custom CSS
 st.markdown("""
     <style>
     .metric-container {
@@ -35,13 +35,13 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Download VADER lexicon (Run once)
+# Download VADER (Run once)
 try:
     nltk.data.find('vader_lexicon')
 except LookupError:
     nltk.download('vader_lexicon')
 
-# --- 2. EXPANDED DATA UNIVERSE (FULL LISTS) ---
+# --- 2. DATA UNIVERSE ---
 INDICES = {
     "NIFTY 50": "^NSEI",
     "NIFTY BANK": "^NSEBANK",
@@ -49,7 +49,6 @@ INDICES = {
     "SENSEX": "^BSESN"
 }
 
-# FULL CONSTITUENTS (As requested)
 CONSTITUENTS = {
     "NIFTY 50": [
         "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
@@ -87,26 +86,23 @@ NEWS_FEEDS = [
     "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"
 ]
 
-# --- 3. MARKET STATUS LOGIC (IST) ---
+# --- 3. MARKET STATUS LOGIC ---
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
+    # Simple Logic: Mon-Fri, 9:15 to 15:30
     if now.weekday() < 5 and (time(9,15) <= now.time() <= time(15,30)):
-        return True, "🟢 MARKET LIVE", 60 # Refresh every 60s
-    return False, "🔴 MARKET CLOSED", 300 # Refresh every 5 mins
+        return True, "🟢 MARKET LIVE", 60 
+    return False, "🔴 MARKET CLOSED", 300
 
 # --- 4. CORE FUNCTIONS ---
-
 @st.cache_data(ttl=300)
 def fetch_data_package(ticker):
-    """Fetches History + Real-time info (Restored from your preferred layout)"""
     stock = yf.Ticker(ticker)
-    
-    # Get 2y History (Needed for 1Y/YTD buttons)
-    hist = stock.history(period="2y")
-    
+    hist = stock.history(period="2y") # 2y for graph buttons
     try:
         info = stock.info
+        # Use info if available, else fallback to history
         todays_open = info.get('open', hist['Open'].iloc[-1])
         prev_close = info.get('previousClose', hist['Close'].iloc[-2])
         day_high = info.get('dayHigh', hist['High'].iloc[-1])
@@ -116,13 +112,12 @@ def fetch_data_package(ticker):
         prev_close = hist['Close'].iloc[-2]
         day_high = hist['High'].iloc[-1]
         day_low = hist['Low'].iloc[-1]
-        
     return hist, todays_open, prev_close, day_high, day_low
 
 def get_hybrid_sentiment():
-    """Combines News + VIX (The 'Pro' Feature)"""
     sia = SentimentIntensityAnalyzer()
     articles = []
+    # Fetch News
     for feed in NEWS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
@@ -135,12 +130,12 @@ def get_hybrid_sentiment():
         scores = [sia.polarity_scores(a)['compound'] for a in articles]
         news_score = np.mean(scores)
     
-    # VIX Impact
+    # Fetch VIX
     try:
         vix_data = yf.download("^INDIAVIX", period="5d", progress=False)['Close']
         current_vix = vix_data.iloc[-1]
         if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
-        # VIX > 20 is Fear (-ve score)
+        # VIX > 20 = Fear (-1.0), VIX < 12 = Greed (+1.0)
         vix_impact = -1 * ((current_vix - 15) / 10) 
         vix_impact = max(min(vix_impact, 1.0), -1.0) 
     except:
@@ -167,10 +162,8 @@ hist, open_p, prev_close, high_p, low_p = fetch_data_package(ticker)
 current_price = hist['Close'].iloc[-1]
 sentiment_score, headlines, current_vix = get_hybrid_sentiment()
 
-# PREDICTION LOGIC
-daily_volatility = hist['Close'].pct_change().std()
+# PREDICTION
 predicted_change = (sentiment_score * 0.015)
-
 if is_open:
     prediction_label = "Predicted Close"
     predicted_value = current_price * (1 + (sentiment_score * 0.005))
@@ -179,15 +172,15 @@ else:
     gap = sentiment_score * 0.015 
     predicted_value = current_price * (1 + gap)
 
-# --- LAYOUT (THE ONE YOU LIKED) ---
+# --- LAYOUT ---
 
-# 1. Header
+# 1. HEADER
 c1, c2 = st.columns([3, 1])
 with c1:
     st.title(f"{selected_index} Command Center")
     st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')} • {status_msg}")
 
-# 2. KEY METRICS ROW (5 Columns - Restored)
+# 2. KEY METRICS (5 Cols)
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
     st.metric("Current Price", f"₹{current_price:,.2f}", delta=f"{((current_price-prev_close)/prev_close)*100:.2f}%")
@@ -203,13 +196,13 @@ with m5:
 
 st.divider()
 
-# 3. CHART & NEWS (3:1 Split - Restored)
+# 3. CHART & NEWS
 g1, g2 = st.columns([3, 1])
 
 with g1:
     st.subheader("Technical View & Uncertainty")
     
-    # --- UPGRADED GRAPH (Cloud + Buttons) ---
+    # Calculate Forecast
     future_dates = [hist.index[-1] + timedelta(days=i) for i in range(1, 6)]
     future_prices = [current_price]
     for _ in range(5):
@@ -217,16 +210,21 @@ with g1:
         future_prices.append(future_prices[-1] * (1 + drift))
     future_prices.pop(0)
     
-    # Cloud Calculation
+    # Calculate Cloud (Standard Deviation)
+    daily_volatility = hist['Close'].pct_change().std()
     std_dev_band = [daily_volatility * price * 2 * np.sqrt(i+1) for i, price in enumerate(future_prices)]
     upper_band = [p + sd for p, sd in zip(future_prices, std_dev_band)]
     lower_band = [p - sd for p, sd in zip(future_prices, std_dev_band)]
 
     fig = go.Figure()
+    
+    # Trace 1: History
     fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='History', line=dict(color='#00F0FF')))
+    
+    # Trace 2: Prediction
     fig.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines+markers', name='AI Forecast', line=dict(color='#FFA500', dash='dot')))
     
-    # The Cloud
+    # Trace 3: Cloud (Fixed Syntax)
     fig.add_trace(go.Scatter(
         x=future_dates + future_dates[::-1],
         y=upper_band + lower_band[::-1],
@@ -234,3 +232,80 @@ with g1:
         fillcolor='rgba(255, 165, 0, 0.2)',
         line=dict(color='rgba(255,255,255,0)'),
         name='Risk Range (2σ)'
+    ))
+
+    # Yahoo Buttons
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year", stepmode="todate"),
+                dict(count=1, label="1Y", step="year", stepmode="backward"),
+                dict(step="all", label="MAX")
+            ]),
+            bgcolor="#262730"
+        )
+    )
+    fig.update_layout(height=450, template="plotly_dark", xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+with g2:
+    st.subheader("AI Sentiment")
+    st.metric("India VIX (Fear)", f"{current_vix:.2f}", delta="Volatility Impact", delta_color="inverse")
+    st.write("---")
+    
+    s_label = "🟢 BULLISH" if sentiment_score > 0.1 else "🔴 BEARISH" if sentiment_score < -0.1 else "⚪ NEUTRAL"
+    st.info(f"Market Mood: {s_label}")
+    st.caption("Key Drivers:")
+    for h in headlines:
+        st.write(f"• {h}")
+
+st.divider()
+
+# 4. CONSTITUENTS (Tabs)
+st.subheader(f"🏗️ {selected_index} Movers (Live)")
+st.caption("Tracking all index constituents. Prices delayed by ~1-2 mins.")
+
+const_tickers = CONSTITUENTS[selected_index]
+# Batch Fetch
+data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False)
+
+table_data = []
+for t in const_tickers:
+    try:
+        # Check if we have data for this ticker
+        if t in data.columns.levels[0]:
+            df_t = data[t]
+            latest = df_t['Close'].iloc[-1]
+            prev = df_t['Close'].iloc[-2]
+            chg_pct = ((latest - prev) / prev) * 100
+            
+            table_data.append({
+                "Company": t.replace(".NS", "").replace(".BO", ""),
+                "Price": latest,
+                "Change %": chg_pct,
+                "Trend": "🟢" if chg_pct > 0 else "🔴"
+            })
+    except: continue
+
+if table_data:
+    df_movers = pd.DataFrame(table_data)
+    
+    t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
+    
+    col_conf = {
+        "Price": st.column_config.NumberColumn(format="₹%.2f"),
+        "Change %": st.column_config.NumberColumn(format="%.2f%%"),
+    }
+    
+    with t1:
+        st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t3:
+        st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+
+# Auto Refresh
+time_module.sleep(refresh_rate)
+st.rerun()
