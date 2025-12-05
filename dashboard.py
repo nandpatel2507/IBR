@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS
+# Custom CSS for Professional UI
 st.markdown("""
     <style>
     .metric-container {
@@ -35,12 +35,13 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# Download VADER Lexicon (Run once)
 try:
     nltk.data.find('vader_lexicon')
 except LookupError:
     nltk.download('vader_lexicon')
 
-# --- 2. DATA UNIVERSE ---
+# --- 2. DATA UNIVERSE (Verified 2025 Tickers) ---
 INDICES = {
     "NIFTY 50": "^NSEI",
     "NIFTY BANK": "^NSEBANK",
@@ -50,16 +51,16 @@ INDICES = {
 
 CONSTITUENTS = {
     "NIFTY 50": [
-        "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
-        "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BPCL.NS", "BHARTIARTL.NS",
-        "BRITANNIA.NS", "CIPLA.NS", "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS",
-        "EICHERMOT.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS",
-        "HEROMOTOCO.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ICICIBANK.NS", "ITC.NS",
-        "INDUSINDBK.NS", "INFY.NS", "JSWSTEEL.NS", "KOTAKBANK.NS", "LTIM.NS",
-        "LT.NS", "M&M.NS", "MARUTI.NS", "NTPC.NS", "NESTLEIND.NS",
-        "ONGC.NS", "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SBIN.NS",
-        "SUNPHARMA.NS", "TCS.NS", "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS",
-        "TECHM.NS", "TITAN.NS", "ULTRACEMCO.NS", "UPL.NS", "WIPRO.NS"
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "ITC.NS", 
+        "BHARTIARTL.NS", "LT.NS", "SBIN.NS", "HINDUNILVR.NS", "BAJFINANCE.NS", 
+        "MARUTI.NS", "AXISBANK.NS", "HCLTECH.NS", "TITAN.NS", "ASIANPAINT.NS", 
+        "SUNPHARMA.NS", "ULTRACEMCO.NS", "TATASTEEL.NS", "NTPC.NS", "POWERGRID.NS", 
+        "M&M.NS", "TATAMOTORS.NS", "ADANIENT.NS", "ADANIPORTS.NS", "BAJAJFINSV.NS", 
+        "COALINDIA.NS", "ONGC.NS", "GRASIM.NS", "JSWSTEEL.NS", "TECHM.NS", 
+        "HINDALCO.NS", "WIPRO.NS", "DIVISLAB.NS", "CIPLA.NS", "APOLLOHOSP.NS", 
+        "DRREDDY.NS", "EICHERMOT.NS", "NESTLEIND.NS", "TATACONSUM.NS", "BRITANNIA.NS", 
+        "SBILIFE.NS", "HDFCLIFE.NS", "HEROMOTOCO.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", 
+        "BPCL.NS", "SHRIRAMFIN.NS", "LTIM.NS"
     ],
     "NIFTY BANK": [
         "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS",
@@ -90,27 +91,29 @@ def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     if now.weekday() < 5 and (time(9,15) <= now.time() <= time(15,30)):
-        return True, "🟢 MARKET LIVE", 60
-    return False, "🔴 MARKET CLOSED", 300
+        return True, "🟢 MARKET LIVE", 60 # 60s Refresh
+    return False, "🔴 MARKET CLOSED", 300 # 5m Refresh
 
-# --- 4. ADVANCED ANALYTICS FUNCTIONS ---
+# --- 4. ANALYTICS ENGINE ---
 
 @st.cache_data(ttl=300)
 def fetch_data_package(ticker):
     stock = yf.Ticker(ticker)
     
-    # 1. Historical (Daily)
+    # 1. Historical Data (2 Years)
     hist_daily = stock.history(period="2y", interval="1d")
     
-    # 2. Intraday (5m)
+    # 2. Intraday Data (1 Day)
     hist_intraday = stock.history(period="1d", interval="5m")
     
-    # 3. Bollinger Bands Calculation
-    hist_daily['SMA20'] = hist_daily['Close'].rolling(window=20).mean()
-    hist_daily['STD20'] = hist_daily['Close'].rolling(window=20).std()
-    hist_daily['Upper'] = hist_daily['SMA20'] + (hist_daily['STD20'] * 2)
-    hist_daily['Lower'] = hist_daily['SMA20'] - (hist_daily['STD20'] * 2)
+    # 3. Bollinger Bands
+    if not hist_daily.empty:
+        hist_daily['SMA20'] = hist_daily['Close'].rolling(window=20).mean()
+        hist_daily['STD20'] = hist_daily['Close'].rolling(window=20).std()
+        hist_daily['Upper'] = hist_daily['SMA20'] + (hist_daily['STD20'] * 2)
+        hist_daily['Lower'] = hist_daily['SMA20'] - (hist_daily['STD20'] * 2)
 
+    # 4. Info Metrics (Safe Fetch)
     try:
         info = stock.info
         todays_open = info.get('open', hist_daily['Open'].iloc[-1])
@@ -125,41 +128,40 @@ def fetch_data_package(ticker):
         
     return hist_daily, hist_intraday, todays_open, prev_close, day_high, day_low
 
-@st.cache_data(ttl=1800) # Cache for 30 mins (PCR doesn't change fast)
+@st.cache_data(ttl=1800) 
 def get_option_chain_pcr(ticker):
-    """Calculates Put-Call Ratio (PCR)"""
+    """Calculates Put-Call Ratio (PCR) from Option Chain"""
     try:
         stock = yf.Ticker(ticker)
-        # Get expiration dates
         exps = stock.options
-        if not exps: return 1.0 # Default Neutral
+        if not exps: return 1.0 # Default
         
-        # Get nearest expiry
+        # Fetch nearest expiry
         opt = stock.option_chain(exps[0])
-        
         calls_vol = opt.calls['volume'].sum()
         puts_vol = opt.puts['volume'].sum()
         
         if calls_vol == 0: return 1.0
-        pcr = puts_vol / calls_vol
-        return pcr
+        return puts_vol / calls_vol
     except:
-        return 1.0 # Fallback
+        return 1.0
 
 def get_fii_proxy():
-    """Uses USD/INR as a proxy for FII Flow"""
+    """Uses USD/INR trend as a proxy for Foreign Money Flow"""
     try:
         data = yf.download("INR=X", period="5d", progress=False)['Close']
+        if isinstance(data, pd.DataFrame): data = data.iloc[:, 0] # Handle multi-index
         trend = (data.iloc[-1] - data.iloc[0])
-        # If USD is going UP, FIIs are Selling (Negative Flow)
-        # If USD is going DOWN, FIIs are Buying (Positive Flow)
-        return "SELLING 🔻" if trend > 0 else "BUYING 🟢", trend
+        # USD UP = Rupee Weak = FII Selling
+        return "SELLING 🔻" if trend > 0 else "BUYING 🟢"
     except:
-        return "NEUTRAL ⚪", 0
+        return "NEUTRAL ⚪"
 
 def get_hybrid_sentiment():
     sia = SentimentIntensityAnalyzer()
     articles = []
+    
+    # News Sentiment
     for feed in NEWS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
@@ -172,10 +174,12 @@ def get_hybrid_sentiment():
         scores = [sia.polarity_scores(a)['compound'] for a in articles]
         news_score = np.mean(scores)
     
+    # VIX (Fear) Sentiment
     try:
         vix_data = yf.download("^INDIAVIX", period="5d", progress=False)['Close']
+        if isinstance(vix_data, pd.DataFrame): vix_data = vix_data.iloc[:, 0]
         current_vix = vix_data.iloc[-1]
-        if isinstance(current_vix, pd.Series): current_vix = current_vix.iloc[0]
+        # VIX Impact: High VIX (>15) = Fear (-ve score)
         vix_impact = -1 * ((current_vix - 15) / 10) 
         vix_impact = max(min(vix_impact, 1.0), -1.0) 
     except:
@@ -185,28 +189,30 @@ def get_hybrid_sentiment():
     final_score = (news_score * 0.5) + (vix_impact * 0.5)
     return final_score, articles[:3], current_vix
 
-# --- 5. MAIN APP ---
+# --- 5. MAIN DASHBOARD UI ---
+
 if 'last_run' not in st.session_state: st.session_state['last_run'] = 0
 
 is_open, status_msg, refresh_rate = get_market_status()
 
+# Sidebar
 st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 st.sidebar.markdown(f"**Status:** {status_msg}")
+st.sidebar.caption(f"Refresh Rate: {refresh_rate}s")
 
-# FETCH DATA PACKAGE
+# FETCH ALL DATA
 hist_daily, hist_intraday, open_p, prev_close, high_p, low_p = fetch_data_package(ticker)
 current_price = hist_daily['Close'].iloc[-1]
 sentiment_score, headlines, current_vix = get_hybrid_sentiment()
-fii_status, usd_trend = get_fii_proxy()
+fii_status = get_fii_proxy()
 pcr_value = get_option_chain_pcr(ticker)
 
-# PREDICTION LOGIC (Enhanced with PCR)
-# PCR > 1.2 is Bullish (Put writing support), PCR < 0.6 is Bearish
-pcr_bias = (pcr_value - 1) * 0.005 
-
+# PREDICTION ENGINE
+pcr_bias = (pcr_value - 1) * 0.005 # PCR Bias
 predicted_change = (sentiment_score * 0.015) + pcr_bias
+
 if is_open:
     prediction_label = "Predicted Close"
     predicted_value = current_price * (1 + (sentiment_score * 0.005))
@@ -215,13 +221,15 @@ else:
     gap = sentiment_score * 0.015 
     predicted_value = current_price * (1 + gap)
 
-# --- LAYOUT ---
+# --- DASHBOARD LAYOUT ---
+
+# Header
 c1, c2 = st.columns([3, 1])
 with c1:
     st.title(f"{selected_index} Command Center")
     st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')} • {status_msg}")
 
-# METRICS ROW
+# Top Metrics Row
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1: st.metric("Current Price", f"₹{current_price:,.2f}", delta=f"{((current_price-prev_close)/prev_close)*100:.2f}%")
 with m2: st.metric("Today's Open", f"₹{open_p:,.2f}", delta=f"{((open_p-prev_close)/prev_close)*100:.2f}%", delta_color="off")
@@ -233,26 +241,27 @@ with m5:
 
 st.divider()
 
-# --- CHART SECTION (TABS) ---
+# Charts & Signals
 g1, g2 = st.columns([3, 1])
 
 with g1:
     st.subheader("Market Trends")
-    tab_intraday, tab_historical = st.tabs(["⏱️ Today (Live)", "📅 Historical + Bollinger"])
+    tab_intra, tab_hist = st.tabs(["⏱️ Today (Live)", "📅 Historical + Bollinger"])
     
-    # 1. INTRADAY
-    with tab_intraday:
+    # 1. Intraday Chart
+    with tab_intra:
         if not hist_intraday.empty:
             fig_intra = go.Figure()
             fig_intra.add_trace(go.Candlestick(
                 x=hist_intraday.index,
                 open=hist_intraday['Open'], high=hist_intraday['High'],
                 low=hist_intraday['Low'], close=hist_intraday['Close'],
-                name='Live Price'
+                name='Price'
             ))
+            # AI Trajectory Line
             last_time = hist_intraday.index[-1]
             fig_intra.add_trace(go.Scatter(
-                x=[last_time, last_time + timedelta(hours=1)], 
+                x=[last_time, last_time + timedelta(hours=1)],
                 y=[current_price, predicted_value],
                 mode='lines+markers', name='AI Trajectory',
                 line=dict(color='#FFA500', dash='dot')
@@ -262,12 +271,11 @@ with g1:
         else:
             st.warning("No intraday data available.")
 
-    # 2. HISTORICAL (With Bollinger Toggle)
-    with tab_historical:
-        # Toggle Checkbox inside the tab
-        show_bollinger = st.checkbox("Show Bollinger Bands", value=False)
-
-        # Forecast Prep
+    # 2. Historical Chart
+    with tab_hist:
+        show_bb = st.checkbox("Show Bollinger Bands", value=False)
+        
+        # Prediction & Cloud Prep
         future_dates = [hist_daily.index[-1] + timedelta(days=i) for i in range(1, 6)]
         future_prices = [current_price]
         for _ in range(5):
@@ -275,132 +283,101 @@ with g1:
             future_prices.append(future_prices[-1] * (1 + drift))
         future_prices.pop(0)
         
-        # Cloud Prep
-        daily_volatility = hist_daily['Close'].pct_change().std()
-        std_dev_band = [daily_volatility * price * 2 * np.sqrt(i+1) for i, price in enumerate(future_prices)]
-        upper_band = [p + sd for p, sd in zip(future_prices, std_dev_band)]
-        lower_band = [p - sd for p, sd in zip(future_prices, std_dev_band)]
+        daily_vol = hist_daily['Close'].pct_change().std()
+        std_band = [daily_vol * price * 2 * np.sqrt(i+1) for i, price in enumerate(future_prices)]
+        upper_b = [p + sd for p, sd in zip(future_prices, std_band)]
+        lower_b = [p - sd for p, sd in zip(future_prices, std_band)]
 
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
         
-        # Bollinger Bands Logic
-        if show_bollinger:
+        if show_bb:
             fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Upper'], line=dict(color='rgba(200,200,200,0.5)', width=1), name='Upper BB'))
             fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Lower'], line=dict(color='rgba(200,200,200,0.5)', width=1), name='Lower BB', fill='tonexty', fillcolor='rgba(200,200,200,0.05)'))
 
         fig_hist.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines+markers', name='AI Forecast', line=dict(color='#FFA500', dash='dot')))
         fig_hist.add_trace(go.Scatter(
             x=future_dates + future_dates[::-1],
-            y=upper_band + lower_band[::-1],
-            fill='toself',
-            fillcolor='rgba(255, 165, 0, 0.2)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='Risk Range'
+            y=upper_b + lower_b[::-1],
+            fill='toself', fillcolor='rgba(255, 165, 0, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'), name='Risk Range'
         ))
 
-        fig_hist.update_xaxes(
-            rangeselector=dict(
-                buttons=list([
-                    dict(count=1, label="1M", step="month", stepmode="backward"),
-                    dict(count=6, label="6M", step="month", stepmode="backward"),
-                    dict(count=1, label="YTD", step="year", stepmode="todate"),
-                    dict(count=1, label="1Y", step="year", stepmode="backward"),
-                    dict(step="all", label="MAX")
-                ]),
-                bgcolor="#262730"
-            )
-        )
+        fig_hist.update_xaxes(rangeselector=dict(buttons=list([
+            dict(count=1, label="1M", step="month", stepmode="backward"),
+            dict(count=6, label="6M", step="month", stepmode="backward"),
+            dict(count=1, label="YTD", step="year", stepmode="todate"),
+            dict(count=1, label="1Y", step="year", stepmode="backward"),
+            dict(step="all", label="MAX")
+        ]), bgcolor="#262730"))
+        
         fig_hist.update_layout(height=420, template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig_hist, use_container_width=True)
 
 with g2:
-    st.subheader("Data Signals")
+    st.subheader("Advanced Signals")
+    st.metric("FII Proxy (USD/INR)", fii_status, delta="Flow Direction", delta_color="off")
     
-    # 1. FII/DII PROXY
-    st.metric("FII Sentiment (Est.)", fii_status, delta="Tracked via USD/INR", delta_color="off")
+    pcr_col = "normal" if pcr_value > 1 else "inverse"
+    st.metric("Put-Call Ratio (PCR)", f"{pcr_value:.2f}", delta=">1 Bullish / <0.7 Bearish", delta_color=pcr_col)
     
-    # 2. PCR RATIO
-    pcr_color = "normal" if pcr_value > 1 else "inverse"
-    st.metric("Put-Call Ratio (PCR)", f"{pcr_value:.2f}", delta=">1 Bullish / <0.7 Bearish", delta_color="off")
-    
-    # 3. VIX
     st.metric("India VIX", f"{current_vix:.2f}", delta="Fear Index", delta_color="inverse")
     
     st.divider()
-    
     st.caption("AI News Scanner:")
     for h in headlines: st.write(f"• {h}")
 
 st.divider()
 
-# --- REPLACEMENT FOR THE BOTTOM 'CONSTITUENTS' SECTION ---
+# --- CONSTITUENTS SECTION ---
 st.subheader(f"🏗️ {selected_index} Movers (Live)")
-st.caption("Tracking all index constituents. Prices delayed by ~1-2 mins.")
-
 const_tickers = CONSTITUENTS[selected_index]
 
-# SAFE BATCH FETCH
 try:
-    # Fetch 2 days of data to calculate change
+    # Batch fetch for speed
     data = yf.download(const_tickers, period="2d", group_by='ticker', progress=False, threads=True)
     
     table_data = []
     for t in const_tickers:
         try:
-            # Handle Single Ticker vs Multi-Index formatting issues
-            if len(const_tickers) == 1:
-                df_t = data
-            else:
-                if t not in data.columns.levels[0]: continue # Skip if download failed
+            # Handle Single vs Multi Index Data Structure
+            if len(const_tickers) == 1: df_t = data
+            else: 
+                if t not in data.columns.levels[0]: continue
                 df_t = data[t]
-
-            # Check if we have enough data (at least 2 rows)
+            
             if len(df_t) < 2: continue
-
+            
             latest = df_t['Close'].iloc[-1]
             prev = df_t['Close'].iloc[-2]
             
-            # Avoid division by zero
-            if prev == 0: continue
+            if pd.isna(latest) or pd.isna(prev) or prev == 0: continue
             
             chg_pct = ((latest - prev) / prev) * 100
-            
             table_data.append({
-                "Company": t.replace(".NS", "").replace(".BO", ""),
+                "Company": t.replace(".NS","").replace(".BO",""),
                 "Price": latest,
                 "Change %": chg_pct,
                 "Trend": "🟢" if chg_pct > 0 else "🔴"
             })
-        except Exception as e:
-            continue # Skip bad tickers silently
+        except: continue
 
     if table_data:
         df_movers = pd.DataFrame(table_data)
-        
         t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
         
         col_conf = {
             "Price": st.column_config.NumberColumn(format="₹%.2f"),
-            "Change %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Change %": st.column_config.NumberColumn(format="%.2f%%")
         }
         
-        with t1:
-            st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
-        with t2:
-            st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
-        with t3:
-            st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
-    else:
-        st.warning("⚠️ Could not fetch constituent data. Yahoo Finance API might be busy.")
+        with t1: st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
+        with t2: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+        with t3: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
 
 except Exception as e:
-    st.error(f"Data Connection Error: {e}")
+    st.warning("Data fetch busy. Retrying in next cycle.")
 
-# Footer
-st.markdown("---")
-st.caption("Powered by AI & Python • Data: Yahoo Finance (Delayed) • Sentiment: NLTK Analysis")
-
-# Auto Refresh Logic
+# Auto-Refresh
 time_module.sleep(refresh_rate)
 st.rerun()
