@@ -299,3 +299,105 @@ with g1:
     # 1. INTRADAY
     with tab_intra:
         if not hist_intraday.empty:
+            show_intra_bb = st.toggle("Show Intraday Volatility (Std Dev)", value=True)
+            
+            fig_intra = go.Figure()
+            
+            # Candles
+            fig_intra.add_trace(go.Candlestick(
+                x=hist_intraday.index,
+                open=hist_intraday['Open'], high=hist_intraday['High'],
+                low=hist_intraday['Low'], close=hist_intraday['Close'],
+                name='Live Price'
+            ))
+            
+            # Intraday Bollinger Bands
+            if show_intra_bb:
+                fig_intra.add_trace(go.Scatter(x=hist_intraday.index, y=hist_intraday['Upper'], line=dict(color='rgba(255, 255, 0, 0.3)', width=1), name='Upper StdDev'))
+                fig_intra.add_trace(go.Scatter(x=hist_intraday.index, y=hist_intraday['Lower'], line=dict(color='rgba(255, 255, 0, 0.3)', width=1), name='Lower StdDev', fill='tonexty', fillcolor='rgba(255, 255, 0, 0.05)'))
+
+            # AI Prediction Line
+            last_time = hist_intraday.index[-1]
+            fig_intra.add_trace(go.Scatter(
+                x=[last_time, last_time + timedelta(hours=1)],
+                y=[current_price, predicted_value],
+                mode='lines+markers', name='AI Trajectory',
+                line=dict(color='#FFA500', dash='dot')
+            ))
+            
+            fig_intra.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False, title="Real-Time Price Action")
+            st.plotly_chart(fig_intra, use_container_width=True)
+        else:
+            st.info("Waiting for market open data...")
+
+    # 2. HISTORICAL
+    with tab_hist:
+        show_bb = st.toggle("Show Historical Bollinger Bands", value=False)
+        
+        future_dates = [hist_daily.index[-1] + timedelta(days=i) for i in range(1, 6)]
+        future_prices = [current_price]
+        for _ in range(5):
+            drift = predicted_change / 5
+            future_prices.append(future_prices[-1] * (1 + drift))
+        future_prices.pop(0)
+        
+        # Cloud Logic
+        daily_vol = hist_daily['Close'].pct_change().std()
+        std_band = [daily_vol * price * 2 * np.sqrt(i+1) for i, price in enumerate(future_prices)]
+        upper_b = [p + sd for p, sd in zip(future_prices, std_band)]
+        lower_b = [p - sd for p, sd in zip(future_prices, std_band)]
+
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
+        
+        if show_bb:
+            fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Upper'], line=dict(color='rgba(200,200,200,0.5)', width=1), name='Upper BB'))
+            fig_hist.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Lower'], line=dict(color='rgba(200,200,200,0.5)', width=1), name='Lower BB', fill='tonexty', fillcolor='rgba(200,200,200,0.05)'))
+
+        fig_hist.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines+markers', name='AI Forecast', line=dict(color='#FFA500', dash='dot')))
+        fig_hist.add_trace(go.Scatter(x=future_dates + future_dates[::-1], y=upper_b + lower_b[::-1], fill='toself', fillcolor='rgba(255, 165, 0, 0.2)', line=dict(color='rgba(255,255,255,0)'), name='Uncertainty Cloud'))
+
+        fig_hist.update_xaxes(rangeselector=dict(buttons=list([
+            dict(count=1, label="1M", step="month", stepmode="backward"),
+            dict(count=6, label="6M", step="month", stepmode="backward"),
+            dict(count=1, label="YTD", step="year", stepmode="todate"),
+            dict(count=1, label="1Y", step="year", stepmode="backward"),
+            dict(step="all", label="MAX")
+        ]), bgcolor="#262730"))
+        
+        fig_hist.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+with g2:
+    st.subheader("📡 Signals")
+    with st.container(border=True):
+        st.metric("FII Proxy (USD/INR)", fii_status, delta="Foreign Flow")
+        st.write("---")
+        pcr_c = "normal" if pcr_value > 1 else "inverse"
+        st.metric("Put-Call Ratio", f"{pcr_value:.2f}", delta=">1 Bullish", delta_color=pcr_c)
+        st.write("---")
+        st.metric("India VIX", f"{current_vix:.2f}", delta="Fear Index", delta_color="inverse")
+    
+    st.subheader("📰 AI News")
+    with st.container(border=True):
+        for h in headlines:
+            st.caption(f"• {h}")
+
+st.markdown("---")
+
+# MOVERS
+st.subheader(f"🏗️ {selected_index} Movers & Shakers")
+const_tickers = CONSTITUENTS[selected_index]
+df_movers = fetch_movers_data(const_tickers)
+
+if not df_movers.empty:
+    t1, t2, t3 = st.tabs(["📋 Full List", "🚀 Top Gainers", "📉 Top Losers"])
+    col_conf = {"Price": st.column_config.NumberColumn(format="₹%.2f"), "Change %": st.column_config.NumberColumn(format="%.2f%%")}
+    with t1: st.dataframe(df_movers.sort_values("Company"), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t2: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+    with t3: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_conf, use_container_width=True, hide_index=True)
+else:
+    st.info("Index constituent data is syncing...")
+
+time_module.sleep(refresh_rate)
+st.rerun()
