@@ -130,16 +130,13 @@ def fetch_data_package(ticker):
     # Intraday (5m)
     hist_intraday = stock.history(period="1d", interval="5m")
     
-    # --- CALC BOLLINGER BANDS (STD DEV) FOR BOTH TIMEFRAMES ---
-    
-    # 1. Daily Bands
+    # --- CALC BOLLINGER BANDS (STD DEV) ---
     if not hist_daily.empty:
         hist_daily['SMA20'] = hist_daily['Close'].rolling(window=20).mean()
         hist_daily['STD20'] = hist_daily['Close'].rolling(window=20).std()
         hist_daily['Upper'] = hist_daily['SMA20'] + (hist_daily['STD20'] * 2)
         hist_daily['Lower'] = hist_daily['SMA20'] - (hist_daily['STD20'] * 2)
 
-    # 2. Intraday Bands (For "Daily Section" Standard Deviation)
     if not hist_intraday.empty:
         hist_intraday['SMA20'] = hist_intraday['Close'].rolling(window=20).mean()
         hist_intraday['STD20'] = hist_intraday['Close'].rolling(window=20).std()
@@ -244,4 +241,61 @@ st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Select Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 st.sidebar.divider()
-st.sidebar.info(f
+st.sidebar.info(f"Status: {status_msg}")
+st.sidebar.caption(f"Next update in {refresh_rate}s")
+
+# Fetch Data
+hist_daily, hist_intraday, open_p, prev_close, high_p, low_p = fetch_data_package(ticker)
+current_price = hist_daily['Close'].iloc[-1]
+sentiment_score, headlines, current_vix = get_hybrid_sentiment()
+fii_status = get_fii_proxy()
+pcr_value = get_option_chain_pcr(ticker)
+
+# Prediction Logic
+pcr_bias = (pcr_value - 1) * 0.005
+predicted_change = (sentiment_score * 0.015) + pcr_bias
+if is_open:
+    prediction_label = "Exp. Close"
+    predicted_value = current_price * (1 + (sentiment_score * 0.005))
+else:
+    prediction_label = "Exp. Open (Tom)"
+    gap = sentiment_score * 0.015 
+    predicted_value = current_price * (1 + gap)
+
+# --- 5. DASHBOARD UI ---
+
+# Header Section
+c1, c2 = st.columns([3, 1])
+with c1:
+    st.title(f"{selected_index} Command Center")
+    st.markdown(f"**Live Analysis & AI Predictions** • *Last Update: {datetime.now().strftime('%H:%M:%S')}*")
+with c2:
+    if is_open:
+        st.success(f"Market is {status_msg}")
+    else:
+        st.error(f"Market is {status_msg}")
+
+st.markdown("---")
+
+# METRICS
+m1, m2, m3, m4, m5 = st.columns(5)
+with m1: st.metric("Current Price", f"₹{current_price:,.2f}", delta=f"{((current_price-prev_close)/prev_close)*100:.2f}%")
+with m2: st.metric("Today's Open", f"₹{open_p:,.2f}", delta=f"{((open_p-prev_close)/prev_close)*100:.2f}%", delta_color="off")
+with m3: st.metric("Day High", f"₹{high_p:,.2f}")
+with m4: st.metric("Day Low", f"₹{low_p:,.2f}")
+with m5: 
+    col = "normal" if predicted_value > current_price else "inverse"
+    st.metric(prediction_label, f"₹{predicted_value:,.2f}", delta=f"AI Bias: {sentiment_score:.2f}", delta_color=col)
+
+st.markdown("---")
+
+# CHARTS
+g1, g2 = st.columns([3, 1])
+
+with g1:
+    st.subheader("📊 Market Trends")
+    tab_intra, tab_hist = st.tabs(["⏱️ Today (Intraday)", "📅 Historical Trends"])
+    
+    # 1. INTRADAY
+    with tab_intra:
+        if not hist_intraday.empty:
