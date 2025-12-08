@@ -83,7 +83,7 @@ def fetch_macro_indicators():
         indicators['us10y'] = float(us10y['Close'].iloc[-1]) if not us10y.empty else 4.5
     except:
         indicators = {'vix': 15.0, 'usdinr': 83.0, 'usdinr_change': 0.0, 'oil_price': 80.0, 
-                     'oil_change': 0.0, 'gold_price': 2000.0, 'sp500_change': 0.0, 'us10y': 4.5}
+                      'oil_change': 0.0, 'gold_price': 2000.0, 'sp500_change': 0.0, 'us10y': 4.5}
     return indicators
 
 @st.cache_data(ttl=1800)
@@ -103,7 +103,7 @@ def get_sentiment():
 
 def calculate_technical_indicators(df):
     if df.empty or len(df) < 50: return {}
-    close, high, low, volume = df['Close'].values, df['High'].values, df['Low'].values, df['Volume'].values
+    close, volume = df['Close'].values, df['Volume'].values
     
     indicators = {
         'sma_20': np.mean(close[-20:]), 'sma_50': np.mean(close[-50:]) if len(close) >= 50 else np.mean(close),
@@ -121,9 +121,14 @@ def calculate_technical_indicators(df):
     # Bollinger Bands
     std_20 = np.std(close[-20:])
     indicators['bb_upper'], indicators['bb_lower'] = indicators['sma_20'] + 2*std_20, indicators['sma_20'] - 2*std_20
-    indicators['bb_position'] = (close[-1] - indicators['bb_lower']) / (indicators['bb_upper'] - indicators['bb_lower'])
+    # Safe BB Position calculation
+    denom = indicators['bb_upper'] - indicators['bb_lower']
+    indicators['bb_position'] = (close[-1] - indicators['bb_lower']) / denom if denom != 0 else 0
     
-    indicators['volume_ratio'] = volume[-1] / np.mean(volume[-20:]) if np.mean(volume[-20:]) > 0 else 1.0
+    # Volume Ratio with safety check
+    vol_mean = np.mean(volume[-20:])
+    indicators['volume_ratio'] = volume[-1] / vol_mean if vol_mean > 0 else 1.0
+    
     indicators['momentum_5'] = (close[-1] / close[-5] - 1) * 100 if len(close) >= 5 else 0
     indicators['momentum_10'] = (close[-1] / close[-10] - 1) * 100 if len(close) >= 10 else 0
     
@@ -131,17 +136,29 @@ def calculate_technical_indicators(df):
 
 def extract_features(hist_df, macro, sentiment_data, tech_ind):
     features = {}
-    if not hist_df.empty and len(hist_df) >= 2:
+    if not hist_df.empty and len(hist_df) >= 21: # Requires at least 21 days for volatility
         close = hist_df['Close'].values
         features['return_1d'] = (close[-1] / close[-2] - 1) * 100
-        features['return_5d'] = (close[-1] / close[-5] - 1) * 100 if len(close) >= 5 else 0
-        features['return_20d'] = (close[-1] / close[-20] - 1) * 100 if len(close) >= 20 else 0
-        features['volatility_20d'] = np.std(np.diff(close[-20:]) / close[-21:-1]) * 100 if len(close) >= 20 else 0
+        features['return_5d'] = (close[-1] / close[-5] - 1) * 100
+        features['return_20d'] = (close[-1] / close[-20] - 1) * 100
+        
+        # --- FIXED VOLATILITY CALCULATION ---
+        # We define a slice of 21 prices to get 20 daily returns
+        price_slice = close[-21:]
+        returns = np.diff(price_slice) / price_slice[:-1]
+        features['volatility_20d'] = np.std(returns) * 100
+    else:
+        # Fallback for insufficient data
+        features['return_1d'] = 0.0
+        features['return_5d'] = 0.0
+        features['return_20d'] = 0.0
+        features['volatility_20d'] = 0.0
     
     features.update(macro)
     features['news_sentiment'], features['news_volatility'] = sentiment_data[0], sentiment_data[1]
     features.update(tech_ind)
-    features['day_of_week'], features['is_month_end'] = datetime.now().weekday(), 1 if datetime.now().day >= 25 else 0
+    features['day_of_week'] = datetime.now().weekday()
+    features['is_month_end'] = 1 if datetime.now().day >= 25 else 0
     return features
 
 # === MACHINE LEARNING MODEL ===
@@ -167,7 +184,13 @@ class AdaptiveEnsemble:
             future_price, current_price = hist_df['Close'].iloc[i+5], hist_df['Close'].iloc[i]
             target = (future_price / current_price - 1) * 100
             
-            X.append(list(features.values()))
+            # Ensure features are a flat list of numbers
+            row = []
+            for k, v in features.items():
+                if isinstance(v, (int, float, np.number)): row.append(v)
+                else: row.append(0.0) # Safety for non-numeric
+            
+            X.append(row)
             y.append(target)
             if i == 50: self.feature_names = list(features.keys())
         
@@ -178,11 +201,13 @@ class AdaptiveEnsemble:
         split = int(0.8 * len(X))
         X_train, X_test, y_train, y_test = X[:split], X[split:], y[:split], y[split:]
         
-        X_train_scaled, X_test_scaled = self.scaler.fit_transform(X_train), self.scaler.transform(X_test)
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
         
         for name, model in self.models.items():
             model.fit(X_train_scaled, y_train)
-            self.weights[name] = max(0.1, model.score(X_test_scaled, y_test))
+            score = model.score(X_test_scaled, y_test)
+            self.weights[name] = max(0.1, score)
         
         total = sum(self.weights.values())
         self.weights = {k: v/total for k, v in self.weights.items()}
@@ -191,7 +216,13 @@ class AdaptiveEnsemble:
     
     def predict(self, features):
         if not self.is_trained: return None
-        X = np.array([list(features.values())])
+        # Convert dictionary to ordered list of values matching training
+        row = []
+        for k, v in features.items():
+            if isinstance(v, (int, float, np.number)): row.append(v)
+            else: row.append(0.0)
+            
+        X = np.array([row])
         X_scaled = self.scaler.transform(X)
         
         predictions = {name: model.predict(X_scaled)[0] for name, model in self.models.items()}
@@ -207,7 +238,8 @@ def model_monte_carlo(price, vol, days=5):
     for _ in range(1000):
         p, path = price, [price]
         for _ in range(days):
-            p = p * np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*np.random.normal(0,1))
+            shock = np.random.normal(0, 1)
+            p = p * np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*shock)
             path.append(p)
         paths.append(path)
     
