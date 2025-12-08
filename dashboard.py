@@ -30,11 +30,9 @@ st.markdown("""
         border-radius: 8px;
     }
     .stPlotlyChart { background-color: #1A1C24; border-radius: 8px; padding: 10px; }
-    .stTabs [aria-selected="true"] { background-color: #FF4B4B !important; color: white !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# Download VADER
 try:
     nltk.data.find('vader_lexicon')
 except LookupError:
@@ -58,7 +56,6 @@ CONSTITUENTS = {
 NEWS_FEEDS = ["https://www.livemint.com/rss/markets", "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"]
 
 # --- 3. ROBUST DATA LOGIC ---
-
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
@@ -68,36 +65,22 @@ def get_market_status():
 
 @st.cache_data(ttl=600)
 def fetch_data_with_retry(ticker):
-    """Fetches chart data with Exponential Backoff"""
     stock = yf.Ticker(ticker)
     backoff = 1
-    
     for attempt in range(3): 
         try:
-            hist_daily = stock.history(period="2y", interval="1d")
+            # CHANGED TO 'max' FOR FULL HISTORY
+            hist_daily = stock.history(period="max", interval="1d")
             hist_intraday = stock.history(period="1d", interval="5m")
-            
             if hist_daily.empty: raise ValueError("Empty Data")
-            
             return hist_daily, hist_intraday, stock.info
-        
         except Exception:
             time_module.sleep(backoff)
             backoff *= 2
-            
     return pd.DataFrame(), pd.DataFrame(), {}
-
-def process_bands(df):
-    if not df.empty:
-        df['SMA20'] = df['Close'].rolling(window=20).mean()
-        df['STD20'] = df['Close'].rolling(window=20).std()
-        df['Upper'] = df['SMA20'] + (df['STD20'] * 2)
-        df['Lower'] = df['SMA20'] - (df['STD20'] * 2)
-    return df
 
 @st.cache_data(ttl=3600)
 def fetch_chunked_movers(const_tickers):
-    """Smart Chunking to avoid rate limits"""
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
     all_data = []
@@ -113,11 +96,8 @@ def fetch_chunked_movers(const_tickers):
                         if t not in data.columns.levels[0]: continue
                         df_t = data[t]
                     if len(df_t) < 2: continue
-                    
-                    # FORCE SCALAR FLOAT CONVERSION
                     latest = float(df_t['Close'].iloc[-1])
                     prev = float(df_t['Close'].iloc[-2])
-                    
                     if pd.isna(latest) or prev == 0: continue
                     chg_pct = ((latest - prev) / prev) * 100
                     all_data.append({
@@ -149,23 +129,17 @@ if hist_daily.empty:
     st.error("⚠️ Data Feed Disrupted. Yahoo Finance is rate-limiting requests. Please wait 30s and refresh.")
     st.stop()
 
-# Process Data
-hist_daily = process_bands(hist_daily)
-hist_intraday = process_bands(hist_intraday)
-
-# Extract Metrics SAFELY (Force Float)
+# Extract Metrics SAFELY
 try:
     current_price = float(hist_daily['Close'].iloc[-1])
     prev_close = float(hist_daily['Close'].iloc[-2])
-    
-    # Safe Get from Info or History
     open_p = float(info.get('open', hist_daily['Open'].iloc[-1]))
     high_p = float(info.get('dayHigh', hist_daily['High'].iloc[-1]))
     low_p = float(info.get('dayLow', hist_daily['Low'].iloc[-1]))
 except:
     current_price = 0.0; prev_close = 1.0; open_p = 0.0; high_p = 0.0; low_p = 0.0
 
-# Sentiment
+# Sentiment & VIX
 sia = SentimentIntensityAnalyzer()
 articles = []
 for feed in NEWS_FEEDS:
@@ -175,27 +149,13 @@ for feed in NEWS_FEEDS:
     except: continue
 news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
 
-# VIX (Robust Extraction)
 try:
     vix_df = yf.download("^INDIAVIX", period="5d", progress=False)
-    # Check if we got a DataFrame or Series, handle MultiIndex
-    if isinstance(vix_df, pd.DataFrame):
-        if 'Close' in vix_df.columns:
-            vix_series = vix_df['Close']
-        else:
-            vix_series = vix_df.iloc[:, 0] # Fallback
-    else:
-        vix_series = vix_df
-        
-    if not vix_series.empty:
-        # FORCE FLOAT CONVERSION
-        current_vix = float(vix_series.iloc[-1])
-    else:
-        current_vix = 15.0
-except Exception as e:
-    current_vix = 15.0
+    vix_series = vix_df['Close'] if 'Close' in vix_df.columns else vix_df.iloc[:, 0]
+    current_vix = float(vix_series.iloc[-1]) if not vix_series.empty else 15.0
+except: current_vix = 15.0
 
-# Prediction
+# Prediction Logic
 pred_change = (news_score * 0.015) + (((current_price - prev_close)/prev_close)*0.5)
 pred_price = current_price * (1 + pred_change)
 
@@ -214,20 +174,58 @@ st.markdown("---")
 
 g1, g2 = st.columns([3, 1])
 with g1:
-    t1, t2 = st.tabs(["Intraday", "Historical"])
+    t1, t2 = st.tabs(["Intraday", "Historical (Max)"])
+    
+    # INTRADAY TAB
     with t1:
         if not hist_intraday.empty:
             fig = go.Figure(go.Candlestick(x=hist_intraday.index, open=hist_intraday['Open'], high=hist_intraday['High'], low=hist_intraday['Low'], close=hist_intraday['Close'], name='Price'))
-            fig.add_trace(go.Scatter(x=hist_intraday.index, y=hist_intraday['Upper'], line=dict(color='rgba(255,255,0,0.3)'), name='Upper BB'))
-            fig.add_trace(go.Scatter(x=hist_intraday.index, y=hist_intraday['Lower'], line=dict(color='rgba(255,255,0,0.3)'), name='Lower BB', fill='tonexty'))
+            
+            # PREDICTION TRAJECTORY (Visualizing the forecast)
+            last_time = hist_intraday.index[-1]
+            fig.add_trace(go.Scatter(
+                x=[last_time, last_time + timedelta(hours=1)],
+                y=[current_price, pred_price],
+                mode='lines+markers', name='AI Prediction',
+                line=dict(color='#FFA500', dash='dot', width=3)
+            ))
+            
             fig.update_layout(template="plotly_dark", height=450, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Intraday data unavailable")
+    
+    # HISTORICAL TAB
     with t2:
-        fig_h = go.Figure(go.Scatter(x=hist_daily.index, y=hist_daily['Close'], line=dict(color='#00F0FF'), name='Price'))
-        fig_h.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Upper'], line=dict(color='rgba(255,255,0,0.3)'), name='Upper BB'))
-        fig_h.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Lower'], line=dict(color='rgba(255,255,0,0.3)'), name='Lower BB', fill='tonexty'))
+        # Prediction for next 5 days
+        future_dates = [hist_daily.index[-1] + timedelta(days=i) for i in range(1, 6)]
+        future_prices = [current_price]
+        for _ in range(5): future_prices.append(future_prices[-1] * (1 + (pred_change/5)))
+        future_prices.pop(0)
+
+        fig_h = go.Figure()
+        fig_h.add_trace(go.Scatter(x=hist_daily.index, y=hist_daily['Close'], line=dict(color='#00F0FF'), name='History'))
+        
+        # PREDICTION TRACE (Bright Orange)
+        fig_h.add_trace(go.Scatter(
+            x=future_dates, y=future_prices, 
+            mode='lines+markers', name='AI Forecast (5D)',
+            line=dict(color='#FFA500', dash='dot', width=3)
+        ))
+        
+        # RESTORED YAHOO BUTTONS (Range Selector)
+        fig_h.update_xaxes(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(count=1, label="YTD", step="year", stepmode="todate"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(step="all", label="MAX")
+                ]),
+                bgcolor="#262730"
+            )
+        )
         fig_h.update_layout(template="plotly_dark", height=450)
         st.plotly_chart(fig_h, use_container_width=True)
 
@@ -238,7 +236,7 @@ with g2:
 
 st.markdown("---")
 
-# MOVERS (LAZY LOAD BUTTON)
+# MOVERS
 st.subheader(f"🏗️ {selected_index} Movers")
 st.info("ℹ️ To prevent data crashes, Movers are loaded on demand.")
 
@@ -252,6 +250,5 @@ if st.button("🚀 Scan Market Movers (Safe Mode)"):
     else:
         st.error("Could not fetch movers. Try again in 1 minute.")
 
-# Loop
 time_module.sleep(refresh_rate)
 st.rerun()
