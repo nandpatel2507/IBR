@@ -115,57 +115,72 @@ def fetch_main_data(ticker):
         return hist_max, hist_intra, metrics
     except: return pd.DataFrame(), pd.DataFrame(), {}
 
-@st.cache_data(ttl=3600)
 def fetch_movers_batch(const_tickers):
-    """Fetches Movers in Chunks to avoid Bans"""
+    """Fetches Movers in Chunks - FIXED VERSION"""
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
-    all_data = []
+    all_data = {}  # Changed to dict to prevent duplicates by ticker
     
     prog = st.progress(0, "Scanning Market Components...")
     
     for i, chunk in enumerate(chunks):
         try:
-            # Threading off for stability
+            # Download data for chunk
             data = yf.download(chunk, period="2d", group_by='ticker', progress=False, threads=False)
-            for t in chunk:
+            
+            for ticker in chunk:
                 try:
-                    if len(chunk) == 1: df_t = data
-                    else: 
-                        if t not in data.columns.levels[0]: continue
-                        df_t = data[t]
+                    # Handle single vs multiple ticker data structure
+                    if len(chunk) == 1:
+                        df_ticker = data
+                    else:
+                        if ticker not in data.columns.levels[0]:
+                            continue
+                        df_ticker = data[ticker]
                     
-                    if len(df_t) < 2: continue
-                    latest = float(df_t['Close'].iloc[-1])
-                    prev = float(df_t['Close'].iloc[-2])
-                    if pd.isna(latest) or prev == 0: continue
+                    if len(df_ticker) < 2:
+                        continue
                     
-                    all_data.append({
-                        "Company": t.replace(".NS","").replace(".BO",""),
+                    latest = float(df_ticker['Close'].iloc[-1])
+                    prev = float(df_ticker['Close'].iloc[-2])
+                    
+                    if pd.isna(latest) or pd.isna(prev) or prev == 0:
+                        continue
+                    
+                    # Clean company name
+                    clean_name = ticker.replace(".NS", "").replace(".BO", "")
+                    
+                    # Store in dict (automatically handles duplicates)
+                    all_data[clean_name] = {
+                        "Company": clean_name,
                         "Price": latest,
                         "Change %": ((latest - prev) / prev) * 100
-                    })
-                except: continue
-            time_module.sleep(0.5) # Be nice to API
-            prog.progress((i + 1) / len(chunks))
-        except: continue
+                    }
+                    
+                except Exception as e:
+                    continue
             
-    prog.empty()
-    df = pd.DataFrame(all_data)
+            time_module.sleep(0.5)  # Rate limiting
+            prog.progress((i + 1) / len(chunks))
+            
+        except Exception as e:
+            continue
     
-    # NUCLEAR DUPLICATE KILLER
-    if not df.empty:
-        df = df.drop_duplicates(subset=['Company'])
-        
+    prog.empty()
+    
+    # Convert dict to DataFrame (no duplicates possible)
+    df = pd.DataFrame(list(all_data.values()))
+    
     return df
 
+@st.cache_data(ttl=1800)
 def get_sentiment():
     sia = SentimentIntensityAnalyzer()
     articles = []
     for feed in NEWS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
-            for entry in parsed.entries[:5]: articles.append(entry.title) # Top 5 headlines
+            for entry in parsed.entries[:5]: articles.append(entry.title)
         except: continue
     news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
     return news_score, articles
@@ -175,11 +190,11 @@ def get_sentiment():
 def model_monte_carlo(price, vol, days=5):
     """Model 1: Monte Carlo Simulation (Statistical)"""
     dt = 1
-    mu = 0.0005 # Assumed daily drift (long term positive)
+    mu = 0.0005
     sigma = vol / 100 
     
     paths = []
-    for _ in range(500): # 500 Simulations
+    for _ in range(500):
         p = price
         path = [p]
         for _ in range(days):
@@ -193,23 +208,31 @@ def model_monte_carlo(price, vol, days=5):
 
 def model_technical(price, change_pct, news_score):
     """Model 2: Technical + Sentiment Voting (Momentum)"""
-    # Simple Momentum Logic
-    tech_drift = change_pct * 0.5 # Momentum continues half the time
-    sent_drift = news_score * 0.01 # News impact
-    
+    tech_drift = change_pct * 0.5
+    sent_drift = news_score * 0.01
     total_drift = tech_drift + sent_drift
     target = price * (1 + total_drift)
     return target
 
 # --- 4. MAIN APP EXECUTION ---
 
-if 'last_run' not in st.session_state: st.session_state['last_run'] = 0
+# Initialize Session State
+if 'movers_data' not in st.session_state:
+    st.session_state['movers_data'] = pd.DataFrame()
+if 'current_index' not in st.session_state:
+    st.session_state['current_index'] = None
+
 is_open, status_msg, refresh_rate = get_market_status()
 
 # Sidebar
 st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Select Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
+
+# Reset movers data if index changed
+if st.session_state['current_index'] != selected_index:
+    st.session_state['movers_data'] = pd.DataFrame()
+    st.session_state['current_index'] = selected_index
 
 # Main Fetch
 hist_max, hist_intra, metrics = fetch_main_data(ticker)
@@ -235,7 +258,6 @@ m[0].metric("Price", f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metric
 m[1].metric("Open", f"₹{metrics['open']:,.2f}", delta_color="off")
 m[2].metric("High", f"₹{metrics['high']:,.2f}", delta_color="off")
 m[3].metric("Low", f"₹{metrics['low']:,.2f}", delta_color="off")
-# Consensus Metric
 c_col = "normal" if consensus_target > metrics['price'] else "inverse"
 m[4].metric("AI Consensus", f"₹{consensus_target:,.2f}", "Avg of 2 Models", delta_color=c_col)
 
@@ -245,13 +267,11 @@ st.markdown("---")
 g_col, s_col = st.columns([3, 1])
 
 with g_col:
-    # 1. Prediction Breakdown
     with st.expander("🧠 View Prediction Models (Monte Carlo vs Technical)", expanded=False):
         c1, c2 = st.columns(2)
         c1.metric("Monte Carlo Model", f"₹{mc_target:,.2f}", "Statistical Sim")
         c2.metric("Technical Model", f"₹{tech_target:,.2f}", "Momentum + News")
     
-    # 2. Main Chart
     st.subheader("📈 Market Trends")
     time_range = st.radio("Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True, label_visibility="collapsed")
     
@@ -260,12 +280,10 @@ with g_col:
     if time_range == "1D":
         if not hist_intra.empty:
             fig.add_trace(go.Scatter(x=hist_intra.index, y=hist_intra['Close'], mode='lines', name='Price', line=dict(color='#00F0FF', width=2)))
-            # Intraday Forecast Line
             last_t = hist_intra.index[-1]
             fig.add_trace(go.Scatter(x=[last_t, last_t+timedelta(hours=1)], y=[metrics['price'], consensus_target], mode='lines+markers', name='Forecast', line=dict(color='#FFA500', dash='dot')))
         else: st.warning("Intraday data hidden (Market Closed)")
     else:
-        # Historical Filter
         df_p = hist_max.copy()
         end_d = df_p.index[-1]
         if time_range == "1M": start_d = end_d - timedelta(days=30)
@@ -277,7 +295,6 @@ with g_col:
         df_p = df_p[df_p.index >= start_d]
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
         
-        # 5-Day Forecast Line
         fdates = [df_p.index[-1] + timedelta(days=i) for i in range(1, 6)]
         fig.add_trace(go.Scatter(x=fdates, y=mc_path[1:], mode='lines+markers', name='AI Projection', line=dict(color='#FFA500', dash='dot')))
 
@@ -285,46 +302,45 @@ with g_col:
     st.plotly_chart(fig, use_container_width=True)
 
 with s_col:
-    # 3. Restored News Section
     st.subheader("📰 Sentiment")
     st.metric("News Score", f"{news_score:.2f}", "-1 (Bear) to +1 (Bull)")
     
     with st.container(border=True):
         st.write("**Top Headlines:**")
-        for h in headlines:
+        for h in headlines[:5]:  # Limit to 5
             st.caption(f"• {h}")
 
 st.markdown("---")
 
-# --- MOVERS SECTION (Using Session State to fix Duplication) ---
+# --- MOVERS SECTION (FIXED) ---
 st.subheader("📊 Market Components")
 
-# Initialize Session State for Movers
-if 'movers_data' not in st.session_state:
-    st.session_state['movers_data'] = pd.DataFrame()
-
 # Load Button
-if st.button("🚀 Load Market Movers (Click Once)"):
-    st.session_state['movers_data'] = fetch_movers_batch(CONSTITUENTS[selected_index])
+if st.button("🚀 Load Market Movers", key="load_movers_btn"):
+    with st.spinner("Fetching market data..."):
+        st.session_state['movers_data'] = fetch_movers_batch(CONSTITUENTS[selected_index])
 
-# Display Table from Session State (Persistent)
+# Display Table
 if not st.session_state['movers_data'].empty:
-    df_m = st.session_state['movers_data']
+    df_m = st.session_state['movers_data'].copy()
     
     t_all, t_gain, t_loss = st.tabs(["📋 Full List", "🟢 Top Gainers", "🔴 Top Losers"])
     
-    # Beautiful Column Config
     cfg = {
         "Price": st.column_config.NumberColumn(format="₹%.2f"),
         "Change %": st.column_config.ProgressColumn("Change %", format="%.2f%%", min_value=-5, max_value=5),
     }
     
-    with t_all: st.dataframe(df_m.sort_values("Company"), column_config=cfg, use_container_width=True, hide_index=True)
-    with t_gain: st.dataframe(df_m.sort_values("Change %", ascending=False).head(10), column_config=cfg, use_container_width=True, hide_index=True)
-    with t_loss: st.dataframe(df_m.sort_values("Change %", ascending=True).head(10), column_config=cfg, use_container_width=True, hide_index=True)
+    with t_all: 
+        st.dataframe(df_m.sort_values("Company"), column_config=cfg, use_container_width=True, hide_index=True)
+    with t_gain: 
+        st.dataframe(df_m.nlargest(10, "Change %"), column_config=cfg, use_container_width=True, hide_index=True)
+    with t_loss: 
+        st.dataframe(df_m.nsmallest(10, "Change %"), column_config=cfg, use_container_width=True, hide_index=True)
 else:
     st.info("Click the button above to scan constituent stocks.")
 
-# Refresh
-time_module.sleep(refresh_rate)
-st.rerun()
+# Auto-refresh logic (removed the problematic st.rerun at the end)
+if is_open:
+    time_module.sleep(refresh_rate)
+    st.rerun()
