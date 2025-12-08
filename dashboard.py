@@ -48,7 +48,6 @@ INDICES = {
     "SENSEX": "^BSESN"
 }
 
-# FULL CONSTITUENTS
 CONSTITUENTS = {
     "NIFTY 50": ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "ITC.NS", "BHARTIARTL.NS", "LT.NS", "SBIN.NS", "HINDUNILVR.NS", "BAJFINANCE.NS", "MARUTI.NS", "AXISBANK.NS", "HCLTECH.NS", "TITAN.NS", "ASIANPAINT.NS", "SUNPHARMA.NS", "ULTRACEMCO.NS", "TATASTEEL.NS", "NTPC.NS", "POWERGRID.NS", "M&M.NS", "TATAMOTORS.NS", "ADANIENT.NS", "ADANIPORTS.NS", "BAJAJFINSV.NS", "COALINDIA.NS", "ONGC.NS", "GRASIM.NS", "JSWSTEEL.NS", "TECHM.NS", "HINDALCO.NS", "WIPRO.NS", "DIVISLAB.NS", "CIPLA.NS", "APOLLOHOSP.NS", "DRREDDY.NS", "EICHERMOT.NS", "NESTLEIND.NS", "TATACONSUM.NS", "BRITANNIA.NS", "SBILIFE.NS", "HDFCLIFE.NS", "HEROMOTOCO.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "BPCL.NS", "SHRIRAMFIN.NS", "LTIM.NS"],
     "NIFTY BANK": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "BANKBARODA.NS", "PNB.NS", "IDFCFIRSTB.NS", "AUBANK.NS", "FEDERALBNK.NS", "BANDHANBNK.NS"],
@@ -73,7 +72,7 @@ def fetch_data_with_retry(ticker):
     stock = yf.Ticker(ticker)
     backoff = 1
     
-    for attempt in range(3): # Try 3 times
+    for attempt in range(3): 
         try:
             hist_daily = stock.history(period="2y", interval="1d")
             hist_intraday = stock.history(period="1d", interval="5m")
@@ -84,7 +83,7 @@ def fetch_data_with_retry(ticker):
         
         except Exception:
             time_module.sleep(backoff)
-            backoff *= 2 # Wait 1s, then 2s
+            backoff *= 2
             
     return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -98,35 +97,28 @@ def process_bands(df):
 
 @st.cache_data(ttl=3600)
 def fetch_chunked_movers(const_tickers):
-    """
-    SMART CHUNKING: Fetches stocks in batches of 10 to avoid bans.
-    """
+    """Smart Chunking to avoid rate limits"""
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
-    
     all_data = []
-    
-    # Show progress to user so they know it's working
     progress_bar = st.progress(0, text="Scanning Market Data...")
     
     for i, chunk in enumerate(chunks):
         try:
-            # Fetch small batch
             data = yf.download(chunk, period="2d", group_by='ticker', progress=False, threads=False)
-            
             for t in chunk:
                 try:
                     if len(chunk) == 1: df_t = data
                     else: 
                         if t not in data.columns.levels[0]: continue
                         df_t = data[t]
-                        
                     if len(df_t) < 2: continue
-                    latest = df_t['Close'].iloc[-1]
-                    prev = df_t['Close'].iloc[-2]
+                    
+                    # FORCE SCALAR FLOAT CONVERSION
+                    latest = float(df_t['Close'].iloc[-1])
+                    prev = float(df_t['Close'].iloc[-2])
                     
                     if pd.isna(latest) or prev == 0: continue
-                    
                     chg_pct = ((latest - prev) / prev) * 100
                     all_data.append({
                         "Company": t.replace(".NS","").replace(".BO",""),
@@ -135,13 +127,9 @@ def fetch_chunked_movers(const_tickers):
                         "Trend": "🟢" if chg_pct > 0 else "🔴"
                     })
                 except: continue
-                
-            # Wait 1s between chunks to be nice to Yahoo
             time_module.sleep(1.0)
             progress_bar.progress((i + 1) / len(chunks), text=f"Scanning Batch {i+1}/{len(chunks)}...")
-            
-        except Exception:
-            continue
+        except Exception: continue
             
     progress_bar.empty()
     return pd.DataFrame(all_data)
@@ -165,15 +153,17 @@ if hist_daily.empty:
 hist_daily = process_bands(hist_daily)
 hist_intraday = process_bands(hist_intraday)
 
-# Extract Metrics
+# Extract Metrics SAFELY (Force Float)
 try:
-    current_price = hist_daily['Close'].iloc[-1]
-    prev_close = hist_daily['Close'].iloc[-2]
-    open_p = info.get('open', hist_daily['Open'].iloc[-1])
-    high_p = info.get('dayHigh', hist_daily['High'].iloc[-1])
-    low_p = info.get('dayLow', hist_daily['Low'].iloc[-1])
+    current_price = float(hist_daily['Close'].iloc[-1])
+    prev_close = float(hist_daily['Close'].iloc[-2])
+    
+    # Safe Get from Info or History
+    open_p = float(info.get('open', hist_daily['Open'].iloc[-1]))
+    high_p = float(info.get('dayHigh', hist_daily['High'].iloc[-1]))
+    low_p = float(info.get('dayLow', hist_daily['Low'].iloc[-1]))
 except:
-    current_price = 0; prev_close = 1; open_p = 0; high_p = 0; low_p = 0
+    current_price = 0.0; prev_close = 1.0; open_p = 0.0; high_p = 0.0; low_p = 0.0
 
 # Sentiment
 sia = SentimentIntensityAnalyzer()
@@ -185,11 +175,25 @@ for feed in NEWS_FEEDS:
     except: continue
 news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
 
-# VIX
+# VIX (Robust Extraction)
 try:
-    vix_data = yf.download("^INDIAVIX", period="5d", progress=False)['Close']
-    current_vix = vix_data.iloc[-1] if not vix_data.empty else 15.0
-except: current_vix = 15.0
+    vix_df = yf.download("^INDIAVIX", period="5d", progress=False)
+    # Check if we got a DataFrame or Series, handle MultiIndex
+    if isinstance(vix_df, pd.DataFrame):
+        if 'Close' in vix_df.columns:
+            vix_series = vix_df['Close']
+        else:
+            vix_series = vix_df.iloc[:, 0] # Fallback
+    else:
+        vix_series = vix_df
+        
+    if not vix_series.empty:
+        # FORCE FLOAT CONVERSION
+        current_vix = float(vix_series.iloc[-1])
+    else:
+        current_vix = 15.0
+except Exception as e:
+    current_vix = 15.0
 
 # Prediction
 pred_change = (news_score * 0.015) + (((current_price - prev_close)/prev_close)*0.5)
