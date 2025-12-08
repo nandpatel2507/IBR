@@ -10,44 +10,51 @@ from datetime import datetime, timedelta, time
 import time as time_module 
 import pytz
 
-# --- 1. CONFIGURATION ---
+# --- 1. PRO UI CONFIGURATION ---
 st.set_page_config(
     page_title="Pro Market Terminal",
-    page_icon="📈",
+    page_icon="🦅",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Professional CSS (Bloomberg/Terminal Style)
+# Custom CSS for "Glassmorphism" look
 st.markdown("""
     <style>
     .stApp { background-color: #0E1117; }
     
-    /* Metrics Box */
+    /* Metrics Styling */
     div[data-testid="stMetric"] {
-        background-color: #1E1E1E;
-        border: 1px solid #333;
+        background-color: #1A1C24;
+        border: 1px solid #2D2D2D;
         padding: 15px;
-        border-radius: 8px;
+        border-radius: 10px;
+        transition: transform 0.2s;
     }
-    
-    /* Chart Container */
-    .stPlotlyChart {
-        background-color: #1E1E1E;
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 10px;
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        border-color: #4A4A4A;
     }
     
     /* Tabs */
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] {
-        background-color: #2D2D2D;
+        background-color: #1A1C24;
         border-radius: 4px;
-        color: white;
+        color: #A0A0A0;
+        padding: 8px 16px;
     }
     .stTabs [aria-selected="true"] {
         background-color: #FF4B4B !important;
+        color: white !important;
+    }
+    
+    /* Chart Border */
+    .stPlotlyChart {
+        background-color: #1A1C24;
+        border: 1px solid #2D2D2D;
+        border-radius: 10px;
+        padding: 15px;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -80,24 +87,17 @@ def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     if now.weekday() < 5 and (time(9,15) <= now.time() <= time(15,30)):
-        return True, "🟢 LIVE", 60 
-    return False, "🔴 CLOSED", 300
+        return True, "🟢 MARKET LIVE", 60 
+    return False, "🔴 MARKET CLOSED", 300
 
 @st.cache_data(ttl=600)
 def fetch_main_data(ticker):
-    """Fetches Max History + Intraday without 'stock.info'"""
     stock = yf.Ticker(ticker)
     try:
-        # 1. Fetch Data
         hist_max = stock.history(period="max", interval="1d")
         hist_intra = stock.history(period="1d", interval="5m")
-        
         if hist_max.empty: return pd.DataFrame(), pd.DataFrame(), {}
         
-        # 2. Calculate Technicals
-        hist_max['SMA20'] = hist_max['Close'].rolling(window=20).mean()
-        
-        # 3. Safe Metrics Extraction
         metrics = {
             "price": float(hist_max['Close'].iloc[-1]),
             "prev": float(hist_max['Close'].iloc[-2]),
@@ -107,24 +107,23 @@ def fetch_main_data(ticker):
             "volatility": float(hist_max['Close'].pct_change().std() * 100)
         }
         return hist_max, hist_intra, metrics
-        
     except: return pd.DataFrame(), pd.DataFrame(), {}
 
 @st.cache_data(ttl=3600)
 def fetch_movers_batch(const_tickers):
-    """Chunked fetching to avoid duplication and bans"""
+    """
+    Chunked fetching + Strict Deduplication
+    """
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
     all_data = []
-    seen = set() # Duplicate protection
     
-    prog = st.progress(0, "Scanning Market...")
+    prog = st.progress(0, "Scanning Market Depth...")
     
     for i, chunk in enumerate(chunks):
         try:
             data = yf.download(chunk, period="2d", group_by='ticker', progress=False, threads=False)
             for t in chunk:
-                if t in seen: continue
                 try:
                     if len(chunk) == 1: df_t = data
                     else: 
@@ -134,22 +133,27 @@ def fetch_movers_batch(const_tickers):
                     if len(df_t) < 2: continue
                     latest = float(df_t['Close'].iloc[-1])
                     prev = float(df_t['Close'].iloc[-2])
-                    
                     if pd.isna(latest) or prev == 0: continue
                     
                     all_data.append({
                         "Company": t.replace(".NS","").replace(".BO",""),
                         "Price": latest,
-                        "Change %": ((latest - prev) / prev) * 100
+                        "Change %": ((latest - prev) / prev) * 100,
+                        "Volume": float(df_t['Volume'].iloc[-1])
                     })
-                    seen.add(t)
                 except: continue
-            time_module.sleep(0.2)
+            time_module.sleep(0.5)
             prog.progress((i + 1) / len(chunks))
         except: continue
             
     prog.empty()
-    return pd.DataFrame(all_data)
+    df = pd.DataFrame(all_data)
+    
+    # STRICT DEDUPLICATION
+    if not df.empty:
+        df = df.drop_duplicates(subset=['Company'])
+        
+    return df
 
 def get_sentiment():
     sia = SentimentIntensityAnalyzer()
@@ -184,8 +188,13 @@ pred_price = metrics['price'] * (1 + pred_change)
 
 # --- 5. VISUAL DASHBOARD ---
 
-st.title(f"{selected_index} Terminal")
-st.caption(f"Status: {status_msg} | Update Rate: {refresh_rate}s")
+c1, c2 = st.columns([3, 1])
+with c1:
+    st.title(f"{selected_index}")
+    st.caption(f"Real-Time Data Feed • {status_msg}")
+with c2:
+    if is_open: st.success(f"Status: {status_msg}")
+    else: st.error(f"Status: {status_msg}")
 
 # Heads Up Display
 m = st.columns(5)
@@ -193,26 +202,24 @@ m[0].metric("Price", f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metric
 m[1].metric("Open", f"₹{metrics['open']:,.2f}", delta_color="off")
 m[2].metric("High", f"₹{metrics['high']:,.2f}", delta_color="off")
 m[3].metric("Low", f"₹{metrics['low']:,.2f}", delta_color="off")
-m[4].metric("AI Target", f"₹{pred_price:,.2f}", f"Sentiment: {news_score:.2f}", delta_color="normal")
+m[4].metric("AI Target", f"₹{pred_price:,.2f}", f"Sent: {news_score:.2f}", delta_color="normal")
 
 st.markdown("---")
 
-# --- MAIN GRAPH AREA WITH TIME SELECTOR ---
+# --- MAIN GRAPH AREA ---
 g_col, s_col = st.columns([3, 1])
 
 with g_col:
-    # Time Range Selector (Like MoneyControl/Yahoo)
-    time_range = st.radio("Time Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True)
+    # Time Range Selector
+    time_range = st.radio("Time Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True, label_visibility="collapsed")
     
     fig = go.Figure()
     
     # Logic to switch between Intraday and Historical
     if time_range == "1D":
-        # SHOW INTRADAY
         if not hist_intra.empty:
-            fig.add_trace(go.Scatter(x=hist_intra.index, y=hist_intra['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
-            
-            # Forecast Line (Intraday)
+            fig.add_trace(go.Scatter(x=hist_intra.index, y=hist_intra['Close'], mode='lines', name='Price', line=dict(color='#00F0FF', width=2)))
+            # Forecast Line
             last_time = hist_intra.index[-1]
             fig.add_trace(go.Scatter(
                 x=[last_time, last_time + timedelta(hours=1)],
@@ -220,15 +227,12 @@ with g_col:
                 mode='lines+markers', name='Forecast',
                 line=dict(color='#FFA500', dash='dot', width=2)
             ))
-            fig.update_layout(title=f"Intraday: {selected_index}")
+            fig.update_layout(title=f"Intraday Action")
         else:
-            st.warning("Intraday data unavailable (Market Closed). Switch to 1M/6M.")
+            st.warning("Intraday data unavailable (Market Closed). Switch to 1M.")
     
     else:
-        # SHOW HISTORICAL (Filtered)
         df_plot = hist_max.copy()
-        
-        # Filtering Logic
         end_date = df_plot.index[-1]
         if time_range == "1M": start_date = end_date - timedelta(days=30)
         elif time_range == "6M": start_date = end_date - timedelta(days=180)
@@ -245,43 +249,57 @@ with g_col:
         future_prices = [metrics['price'] * (1 + (pred_change/5)*i) for i in range(1, 6)]
         
         fig.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines+markers', name='AI Forecast', line=dict(color='#FFA500', dash='dot')))
-        fig.update_layout(title=f"{time_range} Trend: {selected_index}")
+        fig.update_layout(title=f"{time_range} Trend Analysis")
 
     fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
 with s_col:
-    st.subheader("📰 Logic & News")
-    st.info(f"The model predicts a {pred_change*100:.2f}% move based on {metrics['volatility']:.2f}% volatility and sentiment.")
-    for h in headlines:
-        st.caption(f"• {h}")
+    st.subheader("📰 AI Insights")
+    with st.container(border=True):
+        st.info(f"Model predicts a {pred_change*100:.2f}% move based on current volatility of {metrics['volatility']:.2f}%.")
+        for h in headlines:
+            st.caption(f"• {h}")
 
 st.markdown("---")
 
-# --- LOWER SECTION: TABS FOR MOVERS ---
-st.subheader("📊 Market Components")
+# --- MOVERS SECTION (VISUALLY ENHANCED) ---
+st.subheader("📊 Market Depth & Components")
 
-tab_movers, tab_details = st.tabs(["🚀 Top Movers & Shakers", "ℹ️ Component Details"])
+# Using a container for the button keeps it clean
+with st.container(border=True):
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        load_btn = st.button("🚀 Load Movers Table", use_container_width=True)
+    with col_info:
+        st.caption("Click to scan all constituent stocks. Data is fetched in batches to prevent API blocks.")
 
-with tab_movers:
-    if st.button("Load Movers Table (Click to Refresh)"):
-        df_movers = fetch_movers_batch(CONSTITUENTS[selected_index])
+if load_btn:
+    df_movers = fetch_movers_batch(CONSTITUENTS[selected_index])
+    
+    if not df_movers.empty:
+        t_all, t_gain, t_loss = st.tabs(["📋 Full List", "🟢 Top Gainers", "🔴 Top Losers"])
         
-        if not df_movers.empty:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("### 🟢 Top Gainers")
-                st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), use_container_width=True, hide_index=True)
-            with c2:
-                st.write("### 🔴 Top Losers")
-                st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), use_container_width=True, hide_index=True)
-        else:
-            st.error("Data fetch failed. Try again in 30 seconds.")
-
-with tab_details:
-    st.info("Full list of companies in this index will appear here.")
-    if 'df_movers' in locals() and not df_movers.empty:
-        st.dataframe(df_movers.sort_values("Company"), use_container_width=True)
+        # PRO COLUMN CONFIGURATION
+        column_cfg = {
+            "Price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Change %": st.column_config.ProgressColumn(
+                "Change %", 
+                format="%.2f%%", 
+                min_value=-5, 
+                max_value=5
+            ),
+            "Volume": st.column_config.NumberColumn(format="%d")
+        }
+        
+        with t_all:
+            st.dataframe(df_movers.sort_values("Company"), column_config=column_cfg, use_container_width=True, hide_index=True)
+        with t_gain:
+            st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=column_cfg, use_container_width=True, hide_index=True)
+        with t_loss:
+            st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=column_cfg, use_container_width=True, hide_index=True)
+    else:
+        st.error("Data fetch failed. Try again in 30 seconds.")
 
 # Auto Refresh
 time_module.sleep(refresh_rate)
