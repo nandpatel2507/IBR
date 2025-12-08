@@ -18,33 +18,49 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Custom CSS for "Glassmorphism" Look
 st.markdown("""
     <style>
     .stApp { background-color: #0E1117; }
     
-    /* Metrics Styling */
+    /* Cards/Containers */
     div[data-testid="stMetric"] {
         background-color: #1A1C24;
-        border: 1px solid #2D2D2D;
+        border: 1px solid #333;
         padding: 15px;
-        border-radius: 10px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        transition: transform 0.2s;
+    }
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        border-color: #00F0FF;
     }
     
     /* Chart Container */
     .stPlotlyChart {
         background-color: #1A1C24;
-        border: 1px solid #2D2D2D;
-        border-radius: 10px;
+        border: 1px solid #333;
+        border-radius: 12px;
         padding: 15px;
     }
     
-    /* Progress Bar Color */
-    .stProgress > div > div > div > div {
-        background-color: #FFA500;
+    /* Tab Styling */
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #1A1C24;
+        border-radius: 8px;
+        padding: 10px 20px;
+        color: white;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #FF4B4B !important;
+        color: white !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
+# Download VADER Lexicon
 try:
     nltk.data.find('vader_lexicon')
 except LookupError:
@@ -67,7 +83,7 @@ CONSTITUENTS = {
 
 NEWS_FEEDS = ["https://www.livemint.com/rss/markets", "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"]
 
-# --- 3. ROBUST DATA ENGINE ---
+# --- 3. CORE LOGIC (MODELS & DATA) ---
 
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
@@ -78,12 +94,15 @@ def get_market_status():
 
 @st.cache_data(ttl=600)
 def fetch_main_data(ticker):
+    """Fetches Chart Data (Cached 10 mins)"""
     stock = yf.Ticker(ticker)
     try:
-        # Max history for robust volatility calculations
-        hist_max = stock.history(period="2y", interval="1d")
+        hist_max = stock.history(period="max", interval="1d")
         hist_intra = stock.history(period="1d", interval="5m")
         if hist_max.empty: return pd.DataFrame(), pd.DataFrame(), {}
+        
+        # Calculate Volatility
+        volatility = hist_max['Close'].pct_change().std() * 100
         
         metrics = {
             "price": float(hist_max['Close'].iloc[-1]),
@@ -91,31 +110,31 @@ def fetch_main_data(ticker):
             "open": float(hist_max['Open'].iloc[-1]),
             "high": float(hist_max['High'].iloc[-1]),
             "low": float(hist_max['Low'].iloc[-1]),
-            "volatility": float(hist_max['Close'].pct_change().std()) # Daily Volatility
+            "volatility": volatility
         }
         return hist_max, hist_intra, metrics
     except: return pd.DataFrame(), pd.DataFrame(), {}
 
 @st.cache_data(ttl=3600)
 def fetch_movers_batch(const_tickers):
-    """Chunked fetching + Strict Deduplication"""
+    """Fetches Movers in Chunks to avoid Bans"""
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
     all_data = []
-    seen = set()
     
-    prog = st.progress(0, "Scanning Market Depth...")
+    prog = st.progress(0, "Scanning Market Components...")
     
     for i, chunk in enumerate(chunks):
         try:
+            # Threading off for stability
             data = yf.download(chunk, period="2d", group_by='ticker', progress=False, threads=False)
             for t in chunk:
-                if t in seen: continue
                 try:
                     if len(chunk) == 1: df_t = data
                     else: 
                         if t not in data.columns.levels[0]: continue
                         df_t = data[t]
+                    
                     if len(df_t) < 2: continue
                     latest = float(df_t['Close'].iloc[-1])
                     prev = float(df_t['Close'].iloc[-2])
@@ -124,18 +143,20 @@ def fetch_movers_batch(const_tickers):
                     all_data.append({
                         "Company": t.replace(".NS","").replace(".BO",""),
                         "Price": latest,
-                        "Change %": ((latest - prev) / prev) * 100,
-                        "Volume": float(df_t['Volume'].iloc[-1])
+                        "Change %": ((latest - prev) / prev) * 100
                     })
-                    seen.add(t)
                 except: continue
-            time_module.sleep(0.2)
+            time_module.sleep(0.5) # Be nice to API
             prog.progress((i + 1) / len(chunks))
         except: continue
             
     prog.empty()
     df = pd.DataFrame(all_data)
-    if not df.empty: df = df.drop_duplicates(subset=['Company'])
+    
+    # NUCLEAR DUPLICATE KILLER
+    if not df.empty:
+        df = df.drop_duplicates(subset=['Company'])
+        
     return df
 
 def get_sentiment():
@@ -144,94 +165,49 @@ def get_sentiment():
     for feed in NEWS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
-            for entry in parsed.entries[:3]: articles.append(entry.title)
+            for entry in parsed.entries[:5]: articles.append(entry.title) # Top 5 headlines
         except: continue
     news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
     return news_score, articles
 
-# --- 4. ADVANCED FINANCIAL MODELING ---
+# --- PREDICTION MODELS ---
 
-def calculate_technical_signals(df):
-    """
-    Computes Quant Technical Indicators:
-    1. RSI (Momentum)
-    2. MACD (Trend)
-    3. EMA 20 (Support/Resistance)
-    """
-    # RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+def model_monte_carlo(price, vol, days=5):
+    """Model 1: Monte Carlo Simulation (Statistical)"""
+    dt = 1
+    mu = 0.0005 # Assumed daily drift (long term positive)
+    sigma = vol / 100 
     
-    # MACD
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    
-    # EMA 20
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    
-    # Latest Signals
-    latest = df.iloc[-1]
-    
-    score = 0
-    reasons = []
-    
-    # RSI Logic
-    if latest['RSI'] < 30: 
-        score += 1; reasons.append("RSI Oversold (Bullish)")
-    elif latest['RSI'] > 70: 
-        score -= 1; reasons.append("RSI Overbought (Bearish)")
-    
-    # MACD Logic
-    if latest['MACD'] > latest['Signal_Line']: 
-        score += 1; reasons.append("MACD Bullish Crossover")
-    else: 
-        score -= 1; reasons.append("MACD Bearish Trend")
-        
-    # Trend Logic
-    if latest['Close'] > latest['EMA20']:
-        score += 0.5; reasons.append("Price > 20 EMA (Uptrend)")
-    else:
-        score -= 0.5; reasons.append("Price < 20 EMA (Downtrend)")
-        
-    return score, reasons
-
-def monte_carlo_simulation(start_price, mu, sigma, days=5, simulations=500):
-    """
-    Performs Geometric Brownian Motion Simulation.
-    S_t = S_0 * exp((mu - 0.5*sigma^2)t + sigma*W_t)
-    """
-    dt = 1 # daily steps
-    simulation_results = np.zeros((simulations, days))
-    
-    for i in range(simulations):
-        price_path = [start_price]
-        for d in range(days):
-            # Random Shock
+    paths = []
+    for _ in range(500): # 500 Simulations
+        p = price
+        path = [p]
+        for _ in range(days):
             shock = np.random.normal(0, 1)
-            # Drift + Shock
-            drift = (mu - 0.5 * sigma**2) * dt
-            diffusion = sigma * np.sqrt(dt) * shock
-            price = price_path[-1] * np.exp(drift + diffusion)
-            price_path.append(price)
-        simulation_results[i, :] = price_path[1:]
-        
-    # Calculate Mean Path (Expected) and Confidence Intervals
-    mean_path = np.mean(simulation_results, axis=0)
-    upper_bound = np.percentile(simulation_results, 95, axis=0) # 95% Confidence
-    lower_bound = np.percentile(simulation_results, 5, axis=0)  # 5% Confidence
+            p = p * np.exp((mu - 0.5 * sigma**2)*dt + sigma * np.sqrt(dt) * shock)
+            path.append(p)
+        paths.append(path)
     
-    return mean_path, upper_bound, lower_bound
+    mean_path = np.mean(paths, axis=0)
+    return mean_path, mean_path[-1]
 
-# --- 5. APP EXECUTION ---
+def model_technical(price, change_pct, news_score):
+    """Model 2: Technical + Sentiment Voting (Momentum)"""
+    # Simple Momentum Logic
+    tech_drift = change_pct * 0.5 # Momentum continues half the time
+    sent_drift = news_score * 0.01 # News impact
+    
+    total_drift = tech_drift + sent_drift
+    target = price * (1 + total_drift)
+    return target
+
+# --- 4. MAIN APP EXECUTION ---
+
 if 'last_run' not in st.session_state: st.session_state['last_run'] = 0
 is_open, status_msg, refresh_rate = get_market_status()
 
 # Sidebar
+st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Select Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 
@@ -239,139 +215,116 @@ ticker = INDICES[selected_index]
 hist_max, hist_intra, metrics = fetch_main_data(ticker)
 
 if hist_max.empty:
-    st.error("⚠️ Market Data unavailable. Please refresh.")
+    st.error("⚠️ Data connection issue. Please refresh.")
     st.stop()
 
-# --- RUNNING THE QUANT ENGINE ---
+# Run Models
+news_score, headlines = get_sentiment()
+mc_path, mc_target = model_monte_carlo(metrics['price'], metrics['volatility'])
+tech_target = model_technical(metrics['price'], (metrics['price']-metrics['prev'])/metrics['prev'], news_score)
+consensus_target = (mc_target + tech_target) / 2
 
-# 1. Technical Voting
-tech_score, tech_reasons = calculate_technical_signals(hist_max)
-sentiment_score, headlines = get_sentiment()
+# --- 5. VISUAL DASHBOARD ---
 
-# 2. Monte Carlo Setup
-# Calculate daily log returns mean (Drift) and std (Volatility)
-log_returns = np.log(hist_max['Close'] / hist_max['Close'].shift(1)).dropna()
-mu = log_returns.mean()
-sigma = log_returns.std()
+st.title(f"{selected_index} Command Center")
+st.caption(f"Status: {status_msg} | Updates: {refresh_rate}s")
 
-# 3. Run Simulation (5 Days)
-mc_mean, mc_upper, mc_lower = monte_carlo_simulation(metrics['price'], mu, sigma, days=5)
-pred_price_5d = mc_mean[-1]
-
-# --- 6. VISUAL DASHBOARD ---
-
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.title(f"{selected_index}")
-    st.caption(f"Real-Time Feed • {status_msg}")
-with c2:
-    if is_open: st.success(f"Status: {status_msg}")
-    else: st.error(f"Status: {status_msg}")
-
-# Heads Up
+# Heads Up Metrics
 m = st.columns(5)
 m[0].metric("Price", f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metrics['prev'])/metrics['prev'])*100:.2f}%")
-m[1].metric("Open", f"₹{metrics['open']:,.2f}")
-m[2].metric("High", f"₹{metrics['high']:,.2f}")
-m[3].metric("Low", f"₹{metrics['low']:,.2f}")
-m[4].metric("Exp. Target (5D)", f"₹{pred_price_5d:,.2f}", f"Monte Carlo Mean", delta_color="normal")
+m[1].metric("Open", f"₹{metrics['open']:,.2f}", delta_color="off")
+m[2].metric("High", f"₹{metrics['high']:,.2f}", delta_color="off")
+m[3].metric("Low", f"₹{metrics['low']:,.2f}", delta_color="off")
+# Consensus Metric
+c_col = "normal" if consensus_target > metrics['price'] else "inverse"
+m[4].metric("AI Consensus", f"₹{consensus_target:,.2f}", "Avg of 2 Models", delta_color=c_col)
 
 st.markdown("---")
 
-# GRAPH AREA
+# PREDICTION & GRAPH AREA
 g_col, s_col = st.columns([3, 1])
 
 with g_col:
-    time_range = st.radio("Time Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True, label_visibility="collapsed")
+    # 1. Prediction Breakdown
+    with st.expander("🧠 View Prediction Models (Monte Carlo vs Technical)", expanded=False):
+        c1, c2 = st.columns(2)
+        c1.metric("Monte Carlo Model", f"₹{mc_target:,.2f}", "Statistical Sim")
+        c2.metric("Technical Model", f"₹{tech_target:,.2f}", "Momentum + News")
+    
+    # 2. Main Chart
+    st.subheader("📈 Market Trends")
+    time_range = st.radio("Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True, label_visibility="collapsed")
+    
     fig = go.Figure()
     
     if time_range == "1D":
         if not hist_intra.empty:
             fig.add_trace(go.Scatter(x=hist_intra.index, y=hist_intra['Close'], mode='lines', name='Price', line=dict(color='#00F0FF', width=2)))
-            fig.update_layout(title="Intraday Action")
-        else: st.warning("Intraday data hidden (Market Closed). Switch to 1M.")
+            # Intraday Forecast Line
+            last_t = hist_intra.index[-1]
+            fig.add_trace(go.Scatter(x=[last_t, last_t+timedelta(hours=1)], y=[metrics['price'], consensus_target], mode='lines+markers', name='Forecast', line=dict(color='#FFA500', dash='dot')))
+        else: st.warning("Intraday data hidden (Market Closed)")
     else:
-        df_plot = hist_max.copy()
-        end_date = df_plot.index[-1]
-        if time_range == "1M": start_date = end_date - timedelta(days=30)
-        elif time_range == "6M": start_date = end_date - timedelta(days=180)
-        elif time_range == "1Y": start_date = end_date - timedelta(days=365)
-        elif time_range == "YTD": start_date = datetime(end_date.year, 1, 1).replace(tzinfo=end_date.tzinfo)
-        else: start_date = df_plot.index[0]
+        # Historical Filter
+        df_p = hist_max.copy()
+        end_d = df_p.index[-1]
+        if time_range == "1M": start_d = end_d - timedelta(days=30)
+        elif time_range == "6M": start_d = end_d - timedelta(days=180)
+        elif time_range == "1Y": start_d = end_d - timedelta(days=365)
+        elif time_range == "YTD": start_d = datetime(end_d.year, 1, 1).replace(tzinfo=end_d.tzinfo)
+        else: start_d = df_p.index[0]
         
-        df_plot = df_plot[df_plot.index >= start_date]
+        df_p = df_p[df_p.index >= start_d]
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
         
-        # Historical Line
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'], mode='lines', name='History', line=dict(color='#00F0FF')))
-        
-        # MONTE CARLO FORECAST (The "Cone")
-        future_dates = [df_plot.index[-1] + timedelta(days=i) for i in range(1, 6)]
-        
-        # Most Likely Path
-        fig.add_trace(go.Scatter(x=future_dates, y=mc_mean, mode='lines+markers', name='Expected Path', line=dict(color='#FFA500', dash='dot', width=3)))
-        
-        # Risk Cone (Upper/Lower Bounds)
-        fig.add_trace(go.Scatter(
-            x=future_dates + future_dates[::-1],
-            y=np.concatenate([mc_upper, mc_lower[::-1]]),
-            fill='toself', fillcolor='rgba(255, 165, 0, 0.2)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='95% Confidence Interval'
-        ))
-        
-        fig.update_layout(title=f"{time_range} Trend + Monte Carlo Forecast")
+        # 5-Day Forecast Line
+        fdates = [df_p.index[-1] + timedelta(days=i) for i in range(1, 6)]
+        fig.add_trace(go.Scatter(x=fdates, y=mc_path[1:], mode='lines+markers', name='AI Projection', line=dict(color='#FFA500', dash='dot')))
 
-    fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
+    fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
 with s_col:
-    st.subheader("🧠 Quant Logic")
+    # 3. Restored News Section
+    st.subheader("📰 Sentiment")
+    st.metric("News Score", f"{news_score:.2f}", "-1 (Bear) to +1 (Bull)")
+    
     with st.container(border=True):
-        st.write("**Technical Vote:**")
-        for r in tech_reasons:
-            icon = "✅" if "Bullish" in r or ">" in r else "🔻"
-            st.caption(f"{icon} {r}")
-        
-        st.write("---")
-        st.write("**Sentiment:**")
-        sent_label = "Bullish" if sentiment_score > 0.1 else "Bearish" if sentiment_score < -0.1 else "Neutral"
-        st.info(f"News Sentiment: {sent_label} ({sentiment_score:.2f})")
+        st.write("**Top Headlines:**")
+        for h in headlines:
+            st.caption(f"• {h}")
 
 st.markdown("---")
 
-# MOVERS TAB
-st.subheader("📊 Market Depth")
-tab_movers, tab_info = st.tabs(["🚀 Top Movers", "ℹ️ Methodology"])
+# --- MOVERS SECTION (Using Session State to fix Duplication) ---
+st.subheader("📊 Market Components")
 
-with tab_movers:
-    if st.button("Load Movers Table"):
-        df_movers = fetch_movers_batch(CONSTITUENTS[selected_index])
-        if not df_movers.empty:
-            c1, c2 = st.columns(2)
-            
-            # Use improved column config
-            col_cfg = {
-                "Price": st.column_config.NumberColumn(format="₹%.2f"),
-                "Change %": st.column_config.ProgressColumn("Change %", format="%.2f%%", min_value=-5, max_value=5),
-                "Volume": st.column_config.NumberColumn(format="%d")
-            }
-            
-            with c1:
-                st.write("### 🟢 Gainers")
-                st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), column_config=col_cfg, use_container_width=True, hide_index=True)
-            with c2:
-                st.write("### 🔴 Losers")
-                st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), column_config=col_cfg, use_container_width=True, hide_index=True)
-        else:
-            st.error("Data fetch failed. Try again.")
+# Initialize Session State for Movers
+if 'movers_data' not in st.session_state:
+    st.session_state['movers_data'] = pd.DataFrame()
 
-with tab_info:
-    st.markdown("""
-    ### Prediction Methodology
-    1.  **Monte Carlo Simulation (5D):** Uses Geometric Brownian Motion with historical drift and volatility to simulate 500 future price paths. The orange line is the average of all paths.
-    2.  **Technical Voting:** Aggregates signals from RSI (14), MACD (12,26,9), and EMA (20) to determine current momentum.
-    3.  **Sentiment Analysis:** VADER NLP processes live RSS feeds to adjust short-term bias.
-    """)
+# Load Button
+if st.button("🚀 Load Market Movers (Click Once)"):
+    st.session_state['movers_data'] = fetch_movers_batch(CONSTITUENTS[selected_index])
 
+# Display Table from Session State (Persistent)
+if not st.session_state['movers_data'].empty:
+    df_m = st.session_state['movers_data']
+    
+    t_all, t_gain, t_loss = st.tabs(["📋 Full List", "🟢 Top Gainers", "🔴 Top Losers"])
+    
+    # Beautiful Column Config
+    cfg = {
+        "Price": st.column_config.NumberColumn(format="₹%.2f"),
+        "Change %": st.column_config.ProgressColumn("Change %", format="%.2f%%", min_value=-5, max_value=5),
+    }
+    
+    with t_all: st.dataframe(df_m.sort_values("Company"), column_config=cfg, use_container_width=True, hide_index=True)
+    with t_gain: st.dataframe(df_m.sort_values("Change %", ascending=False).head(10), column_config=cfg, use_container_width=True, hide_index=True)
+    with t_loss: st.dataframe(df_m.sort_values("Change %", ascending=True).head(10), column_config=cfg, use_container_width=True, hide_index=True)
+else:
+    st.info("Click the button above to scan constituent stocks.")
+
+# Refresh
 time_module.sleep(refresh_rate)
 st.rerun()
