@@ -12,22 +12,43 @@ import pytz
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
-    page_title="Market Command Center",
-    page_icon="⚡",
+    page_title="Pro Market Terminal",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
+# Professional CSS (Bloomberg/Terminal Style)
 st.markdown("""
     <style>
     .stApp { background-color: #0E1117; }
+    
+    /* Metrics Box */
     div[data-testid="stMetric"] {
-        background-color: #1A1C24;
+        background-color: #1E1E1E;
         border: 1px solid #333;
         padding: 15px;
         border-radius: 8px;
     }
-    .stPlotlyChart { background-color: #1A1C24; border-radius: 8px; padding: 10px; }
+    
+    /* Chart Container */
+    .stPlotlyChart {
+        background-color: #1E1E1E;
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 10px;
+    }
+    
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #2D2D2D;
+        border-radius: 4px;
+        color: white;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #FF4B4B !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -53,64 +74,7 @@ CONSTITUENTS = {
 
 NEWS_FEEDS = ["https://www.livemint.com/rss/markets", "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"]
 
-# --- 3. ADVANCED QUANT LOGIC ---
-
-def calculate_rsi(series, period=14):
-    """Calculates Relative Strength Index (Technical Indicator)"""
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def get_smart_prediction(hist_df, news_score, volatility):
-    """
-    CORPORATE FINANCE & TECHNICAL COMPOSITE MODEL
-    ---------------------------------------------
-    1. Historical Drift (CAGR): What is the asset's natural growth rate?
-    2. RSI Mean Reversion: Is it overbought (>70) or oversold (<30)?
-    3. Momentum: Is Price > 20-Day Moving Average?
-    4. Sentiment Shock: Adjust drift based on News & VIX.
-    """
-    # 1. Historical Drift (Log Returns Mean)
-    # Using last 30 days to capture recent regime
-    daily_returns = hist_df['Close'].pct_change().tail(30)
-    base_drift = daily_returns.mean() # Daily Expected Return
-    
-    # 2. RSI Factor (Mean Reversion)
-    current_rsi = hist_df['RSI'].iloc[-1]
-    rsi_signal = 0
-    if current_rsi > 70: rsi_signal = -0.002 # Overbought -> Downward pressure
-    elif current_rsi < 30: rsi_signal = 0.003 # Oversold -> Upward pressure
-    
-    # 3. Momentum Factor (Trend)
-    current_price = hist_df['Close'].iloc[-1]
-    sma_20 = hist_df['SMA20'].iloc[-1]
-    momentum_signal = 0.001 if current_price > sma_20 else -0.001
-    
-    # 4. Sentiment & Volatility Shock
-    # High VIX reduces confidence (dampens positive drift)
-    vix_factor = 1.0
-    if volatility > 20: vix_factor = 0.5 
-    
-    sentiment_impact = (news_score * 0.005) * vix_factor
-    
-    # COMPOSITE FORMULA
-    # Predicted Daily Move = (Base Drift + RSI Correction + Momentum + News)
-    predicted_daily_move = base_drift + rsi_signal + momentum_signal + sentiment_impact
-    
-    # Explanation Text for UI
-    logic_text = f"""
-    **Logic Breakdown:**
-    • Base Drift: {base_drift*100:.3f}% (Hist. Return)
-    • RSI ({current_rsi:.1f}): {'Bearish (Overbought)' if current_rsi > 70 else 'Bullish (Oversold)' if current_rsi < 30 else 'Neutral'}
-    • Trend: {'Bullish (>SMA20)' if current_price > sma_20 else 'Bearish (<SMA20)'}
-    • Sentiment: {sentiment_impact*100:.3f}% Impact
-    """
-    
-    return predicted_daily_move, logic_text
-
-# --- 4. DATA ENGINE ---
+# --- 3. ROBUST DATA ENGINE ---
 
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
@@ -121,19 +85,19 @@ def get_market_status():
 
 @st.cache_data(ttl=600)
 def fetch_main_data(ticker):
+    """Fetches Max History + Intraday without 'stock.info'"""
     stock = yf.Ticker(ticker)
     try:
-        # Fetch Max History for robust stats
-        hist_max = stock.history(period="2y", interval="1d")
+        # 1. Fetch Data
+        hist_max = stock.history(period="max", interval="1d")
         hist_intra = stock.history(period="1d", interval="5m")
         
         if hist_max.empty: return pd.DataFrame(), pd.DataFrame(), {}
         
-        # Calculate Technicals (Pandas Vectorized)
+        # 2. Calculate Technicals
         hist_max['SMA20'] = hist_max['Close'].rolling(window=20).mean()
-        hist_max['RSI'] = calculate_rsi(hist_max['Close'])
         
-        # Extract Safe Metrics
+        # 3. Safe Metrics Extraction
         metrics = {
             "price": float(hist_max['Close'].iloc[-1]),
             "prev": float(hist_max['Close'].iloc[-2]),
@@ -144,20 +108,23 @@ def fetch_main_data(ticker):
         }
         return hist_max, hist_intra, metrics
         
-    except Exception: return pd.DataFrame(), pd.DataFrame(), {}
+    except: return pd.DataFrame(), pd.DataFrame(), {}
 
 @st.cache_data(ttl=3600)
-def fetch_chunked_movers(const_tickers):
-    # Batch downloader
+def fetch_movers_batch(const_tickers):
+    """Chunked fetching to avoid duplication and bans"""
     chunk_size = 10
     chunks = [const_tickers[i:i + chunk_size] for i in range(0, len(const_tickers), chunk_size)]
     all_data = []
+    seen = set() # Duplicate protection
     
-    progress_bar = st.progress(0, text="Analyzing Market...")
+    prog = st.progress(0, "Scanning Market...")
+    
     for i, chunk in enumerate(chunks):
         try:
             data = yf.download(chunk, period="2d", group_by='ticker', progress=False, threads=False)
             for t in chunk:
+                if t in seen: continue
                 try:
                     if len(chunk) == 1: df_t = data
                     else: 
@@ -167,6 +134,7 @@ def fetch_chunked_movers(const_tickers):
                     if len(df_t) < 2: continue
                     latest = float(df_t['Close'].iloc[-1])
                     prev = float(df_t['Close'].iloc[-2])
+                    
                     if pd.isna(latest) or prev == 0: continue
                     
                     all_data.append({
@@ -174,114 +142,147 @@ def fetch_chunked_movers(const_tickers):
                         "Price": latest,
                         "Change %": ((latest - prev) / prev) * 100
                     })
+                    seen.add(t)
                 except: continue
-            time_module.sleep(0.5)
-            progress_bar.progress((i + 1) / len(chunks))
+            time_module.sleep(0.2)
+            prog.progress((i + 1) / len(chunks))
         except: continue
-    progress_bar.empty()
+            
+    prog.empty()
     return pd.DataFrame(all_data)
 
-# --- 5. APP EXECUTION ---
+def get_sentiment():
+    sia = SentimentIntensityAnalyzer()
+    articles = []
+    for feed in NEWS_FEEDS:
+        try:
+            parsed = feedparser.parse(feed)
+            for entry in parsed.entries[:3]: articles.append(entry.title)
+        except: continue
+    news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
+    return news_score, articles
+
+# --- 4. APP EXECUTION ---
 if 'last_run' not in st.session_state: st.session_state['last_run'] = 0
 is_open, status_msg, refresh_rate = get_market_status()
 
+# Sidebar
 selected_index = st.sidebar.selectbox("Select Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 
-# Fetch
+# Main Fetch
 hist_max, hist_intra, metrics = fetch_main_data(ticker)
 
 if hist_max.empty:
-    st.error("⚠️ Market Data Connection Failed. Retrying...")
+    st.error("⚠️ Data unavailable. API Limit Reached. Please wait 1 min.")
     st.stop()
 
-# Sentiment
-sia = SentimentIntensityAnalyzer()
-articles = []
-for feed in NEWS_FEEDS:
-    try:
-        parsed = feedparser.parse(feed)
-        for entry in parsed.entries[:3]: articles.append(entry.title)
-    except: continue
-news_score = np.mean([sia.polarity_scores(a)['compound'] for a in articles]) if articles else 0
+# Calculations
+news_score, headlines = get_sentiment()
+pred_change = (news_score * 0.015) + (((metrics['price'] - metrics['prev'])/metrics['prev'])*0.5)
+pred_price = metrics['price'] * (1 + pred_change)
 
-# RUN THE LOGICAL PREDICTION MODEL
-pred_move_pct, logic_explanation = get_smart_prediction(hist_max, news_score, metrics['volatility'])
-pred_price = metrics['price'] * (1 + pred_move_pct)
+# --- 5. VISUAL DASHBOARD ---
 
-# --- UI LAYOUT ---
-st.title(f"{selected_index} Command Center")
-st.caption(f"Status: {status_msg}")
+st.title(f"{selected_index} Terminal")
+st.caption(f"Status: {status_msg} | Update Rate: {refresh_rate}s")
 
-# Heads Up
+# Heads Up Display
 m = st.columns(5)
 m[0].metric("Price", f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metrics['prev'])/metrics['prev'])*100:.2f}%")
-m[1].metric("Open", f"₹{metrics['open']:,.2f}")
-m[2].metric("High", f"₹{metrics['high']:,.2f}")
-m[3].metric("Low", f"₹{metrics['low']:,.2f}")
-m[4].metric("AI Target (1D)", f"₹{pred_price:,.2f}", f"{pred_move_pct*100:.2f}% exp.", delta_color="normal")
+m[1].metric("Open", f"₹{metrics['open']:,.2f}", delta_color="off")
+m[2].metric("High", f"₹{metrics['high']:,.2f}", delta_color="off")
+m[3].metric("Low", f"₹{metrics['low']:,.2f}", delta_color="off")
+m[4].metric("AI Target", f"₹{pred_price:,.2f}", f"Sentiment: {news_score:.2f}", delta_color="normal")
 
 st.markdown("---")
 
-# MAIN CHART
-g1, g2 = st.columns([3, 1])
+# --- MAIN GRAPH AREA WITH TIME SELECTOR ---
+g_col, s_col = st.columns([3, 1])
 
-with g1:
-    st.subheader("📈 Analysis")
-    t1, t2 = st.tabs(["Intraday", "Historical (Max)"])
+with g_col:
+    # Time Range Selector (Like MoneyControl/Yahoo)
+    time_range = st.radio("Time Range", ["1D", "1M", "6M", "YTD", "1Y", "MAX"], horizontal=True)
     
-    with t1:
+    fig = go.Figure()
+    
+    # Logic to switch between Intraday and Historical
+    if time_range == "1D":
+        # SHOW INTRADAY
         if not hist_intra.empty:
-            fig = go.Figure(go.Candlestick(x=hist_intra.index, open=hist_intra['Open'], high=hist_intra['High'], low=hist_intra['Low'], close=hist_intra['Close'], name='Price'))
-            # Visualizing the Prediction
+            fig.add_trace(go.Scatter(x=hist_intra.index, y=hist_intra['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
+            
+            # Forecast Line (Intraday)
             last_time = hist_intra.index[-1]
             fig.add_trace(go.Scatter(
-                x=[last_time, last_time + timedelta(hours=2)],
+                x=[last_time, last_time + timedelta(hours=1)],
                 y=[metrics['price'], pred_price],
-                mode='lines+markers', name='Target Path',
+                mode='lines+markers', name='Forecast',
                 line=dict(color='#FFA500', dash='dot', width=2)
             ))
-            fig.update_layout(template="plotly_dark", height=450, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
-        else: st.info("Intraday unavailable")
+            fig.update_layout(title=f"Intraday: {selected_index}")
+        else:
+            st.warning("Intraday data unavailable (Market Closed). Switch to 1M/6M.")
+    
+    else:
+        # SHOW HISTORICAL (Filtered)
+        df_plot = hist_max.copy()
         
-    with t2:
-        # Forecast 5 Days based on calculated drift
-        dates = [hist_max.index[-1] + timedelta(days=i) for i in range(1, 6)]
-        prices = [metrics['price'] * (1 + (pred_move_pct * i)) for i in range(1, 6)]
+        # Filtering Logic
+        end_date = df_plot.index[-1]
+        if time_range == "1M": start_date = end_date - timedelta(days=30)
+        elif time_range == "6M": start_date = end_date - timedelta(days=180)
+        elif time_range == "1Y": start_date = end_date - timedelta(days=365)
+        elif time_range == "YTD": start_date = datetime(end_date.year, 1, 1).replace(tzinfo=end_date.tzinfo)
+        else: start_date = df_plot.index[0] # MAX
         
-        fig_h = go.Figure()
-        fig_h.add_trace(go.Scatter(x=hist_max.index, y=hist_max['Close'], line=dict(color='#00F0FF'), name='History'))
-        fig_h.add_trace(go.Scatter(x=dates, y=prices, mode='lines+markers', line=dict(color='#FFA500', dash='dot'), name='AI Projection'))
+        df_plot = df_plot[df_plot.index >= start_date]
         
-        fig_h.update_xaxes(rangeselector=dict(buttons=list([
-            dict(count=1, label="1M", step="month", stepmode="backward"),
-            dict(count=6, label="6M", step="month", stepmode="backward"),
-            dict(count=1, label="YTD", step="year", stepmode="todate"),
-            dict(count=1, label="1Y", step="year", stepmode="backward"),
-            dict(step="all", label="MAX")
-        ]), bgcolor="#262730"))
-        fig_h.update_layout(template="plotly_dark", height=450)
-        st.plotly_chart(fig_h, use_container_width=True)
+        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'], mode='lines', name='Price', line=dict(color='#00F0FF')))
+        
+        # Forecast 5D
+        future_dates = [df_plot.index[-1] + timedelta(days=i) for i in range(1, 6)]
+        future_prices = [metrics['price'] * (1 + (pred_change/5)*i) for i in range(1, 6)]
+        
+        fig.add_trace(go.Scatter(x=future_dates, y=future_prices, mode='lines+markers', name='AI Forecast', line=dict(color='#FFA500', dash='dot')))
+        fig.update_layout(title=f"{time_range} Trend: {selected_index}")
 
-with g2:
-    st.subheader("🧠 Model Logic")
-    st.info(logic_explanation)
-    st.metric("Volatility (Risk)", f"{metrics['volatility']:.2f}%")
-    st.caption("Recent Headlines:")
-    for h in articles: st.text(f"• {h[:40]}...")
+    fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+with s_col:
+    st.subheader("📰 Logic & News")
+    st.info(f"The model predicts a {pred_change*100:.2f}% move based on {metrics['volatility']:.2f}% volatility and sentiment.")
+    for h in headlines:
+        st.caption(f"• {h}")
 
 st.markdown("---")
 
-# MOVERS
-st.subheader(f"🏗️ {selected_index} Components")
-if st.button("🚀 Scan Market Movers"):
-    df_movers = fetch_chunked_movers(CONSTITUENTS[selected_index])
-    if not df_movers.empty:
-        t_l, t_g, t_lo = st.tabs(["List", "Gainers", "Losers"])
-        with t_l: st.dataframe(df_movers, use_container_width=True)
-        with t_g: st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), use_container_width=True)
-        with t_lo: st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), use_container_width=True)
+# --- LOWER SECTION: TABS FOR MOVERS ---
+st.subheader("📊 Market Components")
 
+tab_movers, tab_details = st.tabs(["🚀 Top Movers & Shakers", "ℹ️ Component Details"])
+
+with tab_movers:
+    if st.button("Load Movers Table (Click to Refresh)"):
+        df_movers = fetch_movers_batch(CONSTITUENTS[selected_index])
+        
+        if not df_movers.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("### 🟢 Top Gainers")
+                st.dataframe(df_movers.sort_values("Change %", ascending=False).head(10), use_container_width=True, hide_index=True)
+            with c2:
+                st.write("### 🔴 Top Losers")
+                st.dataframe(df_movers.sort_values("Change %", ascending=True).head(10), use_container_width=True, hide_index=True)
+        else:
+            st.error("Data fetch failed. Try again in 30 seconds.")
+
+with tab_details:
+    st.info("Full list of companies in this index will appear here.")
+    if 'df_movers' in locals() and not df_movers.empty:
+        st.dataframe(df_movers.sort_values("Company"), use_container_width=True)
+
+# Auto Refresh
 time_module.sleep(refresh_rate)
 st.rerun()
