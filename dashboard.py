@@ -80,24 +80,49 @@ def get_market_status():
         return True, "🟢 LIVE", 60 
     return False, "🔴 CLOSED", 300
 
-@st.cache_data(ttl=300)  # 5-min cache for intraday
-def fetch_main_data(ticker):
+@st.cache_data(ttl=3600)  # 1-hour cache for historical daily data
+def fetch_historical_data(ticker):
+    """Fetch historical daily data (cached longer)"""
     stock = yf.Ticker(ticker)
     try:
         hist_max = stock.history(period="2y", interval="1d")
+        if hist_max.empty: return pd.DataFrame()
+        return hist_max
+    except: return pd.DataFrame()
+
+def fetch_live_data(ticker, hist_max):
+    """Fetch live intraday data (NO cache for real-time updates)"""
+    stock = yf.Ticker(ticker)
+    try:
         hist_intra = stock.history(period="1d", interval="5m")
-        if hist_max.empty: return pd.DataFrame(), pd.DataFrame(), {}
+        
+        # Use intraday data for current price if market is open
+        is_market_open = get_market_status()[0]
+        
+        if is_market_open and not hist_intra.empty:
+            # Live price from intraday data
+            current_price = float(hist_intra['Close'].iloc[-1])
+            current_high = float(hist_intra['High'].max())
+            current_low = float(hist_intra['Low'].min())
+            current_open = float(hist_intra['Open'].iloc[0])
+        else:
+            # Market closed, use daily data
+            current_price = float(hist_max['Close'].iloc[-1])
+            current_high = float(hist_max['High'].iloc[-1])
+            current_low = float(hist_max['Low'].iloc[-1])
+            current_open = float(hist_max['Open'].iloc[-1])
         
         metrics = {
-            "price": float(hist_max['Close'].iloc[-1]),
+            "price": current_price,
             "prev": float(hist_max['Close'].iloc[-2]),
-            "open": float(hist_max['Open'].iloc[-1]),
-            "high": float(hist_max['High'].iloc[-1]),
-            "low": float(hist_max['Low'].iloc[-1]),
+            "open": current_open,
+            "high": current_high,
+            "low": current_low,
             "volatility": float(hist_max['Close'].pct_change().std() * 100)
         }
-        return hist_max, hist_intra, metrics
-    except: return pd.DataFrame(), pd.DataFrame(), {}
+        return hist_intra, metrics
+    except: 
+        return pd.DataFrame(), {}
 
 @st.cache_data(ttl=3600)
 def fetch_macro_indicators():
@@ -461,8 +486,10 @@ if 'last_intraday_train' not in st.session_state:
     st.session_state['last_intraday_train'] = None
 if 'movers_data' not in st.session_state:
     st.session_state['movers_data'] = pd.DataFrame()
-if 'last_price_logged' not in st.session_state:
-    st.session_state['last_price_logged'] = None
+if 'last_price_tracked' not in st.session_state:
+    st.session_state['last_price_tracked'] = None
+if 'price_changes' not in st.session_state:
+    st.session_state['price_changes'] = []
 
 is_open, status_msg, refresh_rate = get_market_status()
 
@@ -470,11 +497,18 @@ st.sidebar.title("🦅 Market Watch")
 selected_index = st.sidebar.selectbox("Select Index", list(INDICES.keys()))
 ticker = INDICES[selected_index]
 
-# Fetch Data
-hist_max, hist_intra, metrics = fetch_main_data(ticker)
+# Fetch Data - Historical cached, live data NOT cached
+hist_max = fetch_historical_data(ticker)
 if hist_max.empty:
     st.error("⚠️ Data connection failed. Reloading...")
     st.stop()
+
+# Get live data (refreshes every time)
+hist_intra, metrics = fetch_live_data(ticker, hist_max)
+if not metrics:
+    st.error("⚠️ Unable to fetch live data. Retrying...")
+    time_module.sleep(2)
+    st.rerun()
 
 macro = fetch_macro_indicators()
 news_score, headlines = get_sentiment()
@@ -533,21 +567,55 @@ if st.session_state['model_ready']:
 consensus_target = (mc_target + ml_target) / 2
 
 # --- TRACK ACTUAL VS PREDICTED (Online Learning) ---
-if is_open and st.session_state['last_price_logged']:
-    last_price, last_pred = st.session_state['last_price_logged']
-    current_actual_return = (metrics['price'] / last_price - 1) * 100
-    st.session_state['model'].update_with_actual(last_pred, current_actual_return)
-
 if is_open:
-    st.session_state['last_price_logged'] = (metrics['price'], pred_return if pred_return else 0)
+    # Track price changes
+    if st.session_state['last_price_tracked'] is not None:
+        price_change = metrics['price'] - st.session_state['last_price_tracked']
+        if price_change != 0:
+            st.session_state['price_changes'].append({
+                'time': now_ist,
+                'change': price_change,
+                'pct': (price_change / st.session_state['last_price_tracked']) * 100
+            })
+            # Keep only last 50 changes
+            if len(st.session_state['price_changes']) > 50:
+                st.session_state['price_changes'] = st.session_state['price_changes'][-50:]
+    
+    st.session_state['last_price_tracked'] = metrics['price']
+    
+    # Update prediction tracking
+    if 'last_price_logged' in st.session_state and st.session_state['last_price_logged']:
+        last_price, last_pred = st.session_state['last_price_logged']
+        current_actual_return = (metrics['price'] / last_price - 1) * 100
+        st.session_state['model'].update_with_actual(last_pred, current_actual_return)
+    
+    if pred_return:
+        st.session_state['last_price_logged'] = (metrics['price'], pred_return)
 
 # --- VISUAL DASHBOARD ---
 
+# --- VISUAL DASHBOARD ---
+
+# Calculate time since last update
+if not hist_intra.empty:
+    last_update = hist_intra.index[-1]
+    if last_update.tzinfo is None:
+        last_update = ist.localize(last_update)
+    else:
+        last_update = last_update.astimezone(ist)
+    time_ago = (now_ist - last_update).total_seconds()
+    update_str = f"{int(time_ago)}s ago" if time_ago < 60 else f"{int(time_ago/60)}m ago"
+else:
+    update_str = "Market Closed"
+
 st.title(f"{selected_index} Live Command Center")
-st.caption(f"Status: {status_msg} | AI Confidence: {st.session_state['model'].confidence_score:.0%} | Update: {refresh_rate}s")
+st.caption(f"Status: {status_msg} | AI Confidence: {st.session_state['model'].confidence_score:.0%} | Last Update: {update_str} | Auto-refresh: {refresh_rate}s")
 
 m = st.columns(5)
-m[0].metric("Price", f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metrics['prev'])/metrics['prev'])*100:.2f}%")
+
+# Add live indicator
+price_label = "Price 🔴 LIVE" if is_open else "Price"
+m[0].metric(price_label, f"₹{metrics['price']:,.2f}", f"{((metrics['price']-metrics['prev'])/metrics['prev'])*100:.2f}%")
 m[1].metric("Open", f"₹{metrics['open']:,.2f}", delta_color="off")
 m[2].metric("High", f"₹{metrics['high']:,.2f}", delta_color="off")
 m[3].metric("Low", f"₹{metrics['low']:,.2f}", delta_color="off")
@@ -721,6 +789,15 @@ with s_col:
                 st.caption("✅ Intraday Model: Active")
             else:
                 st.caption("⏳ Intraday Model: Building...")
+    
+    # Live price movement tracker
+    if is_open and st.session_state['price_changes']:
+        st.subheader("📊 Live Ticks")
+        with st.container(border=True):
+            recent_changes = st.session_state['price_changes'][-5:]
+            for pc in reversed(recent_changes):
+                emoji = "🟢" if pc['change'] > 0 else "🔴" if pc['change'] < 0 else "⚪"
+                st.caption(f"{emoji} {pc['time'].strftime('%H:%M:%S')}: {pc['change']:+.2f} ({pc['pct']:+.3f}%)")
 
 st.markdown("---")
 
