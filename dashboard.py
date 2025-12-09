@@ -398,7 +398,7 @@ def model_monte_carlo(price, vol, days=5):
 # --- 6. INTRADAY PREDICTION ENGINE ---
 
 def generate_intraday_predictions(current_price, intraday_df, model, daily_feats, ist_now):
-    """Generate predictions for rest of trading day"""
+    """Generate predictions for rest of trading day with risk bands"""
     predictions = []
     
     if not model.is_trained:
@@ -409,22 +409,43 @@ def generate_intraday_predictions(current_price, intraday_df, model, daily_feats
     if intraday_feats is None:
         return predictions
     
+    # Calculate base volatility for risk bands
+    if len(intraday_df) >= 13:
+        recent_returns = np.diff(intraday_df['Close'].values[-13:]) / intraday_df['Close'].values[-14:-1]
+        base_volatility = np.std(recent_returns)
+    else:
+        base_volatility = 0.01  # 1% default
+    
     # Predict next 30 minutes in 5-min intervals
     current_price_sim = current_price
     for mins_ahead in [5, 10, 15, 30]:
         # Adjust time feature
         future_time = ist_now + timedelta(minutes=mins_ahead)
         intraday_feats['time_of_day'] = future_time.hour + future_time.minute / 60
-        intraday_feats['minutes_into_session'] = (future_time.hour - 9) * 60 + (future_time.minute - 15)
+        intraday_feats['minutes_into_session'] = max(0, (future_time.hour - 9) * 60 + (future_time.minute - 15))
         
         pred_return, intra_pred = model.predict_next_movement(daily_feats, intraday_feats)
         
         if pred_return is not None:
             predicted_price = current_price_sim * (1 + pred_return / 100)
+            
+            # Calculate risk bands (confidence intervals)
+            # Risk increases with time horizon and model uncertainty
+            time_multiplier = np.sqrt(mins_ahead / 5)  # Risk scales with sqrt of time
+            confidence_multiplier = (1 - model.confidence_score) + 0.5  # Lower confidence = wider bands
+            risk_pct = base_volatility * time_multiplier * confidence_multiplier * 100
+            
+            upper_band = predicted_price * (1 + risk_pct / 100)
+            lower_band = predicted_price * (1 - risk_pct / 100)
+            
             predictions.append({
-                'time': future_time.strftime('%H:%M'),
+                'time': future_time,
+                'time_str': future_time.strftime('%H:%M'),
                 'price': predicted_price,
-                'confidence': model.confidence_score
+                'upper': upper_band,
+                'lower': lower_band,
+                'confidence': model.confidence_score,
+                'risk_pct': risk_pct
             })
             current_price_sim = predicted_price  # Chain predictions
     
@@ -538,18 +559,23 @@ st.markdown("---")
 # Intraday Predictions Display
 if is_open and intraday_predictions:
     st.markdown('<div class="prediction-update">', unsafe_allow_html=True)
-    st.subheader("🔮 Live Intraday Forecast")
+    st.subheader("🔮 Live Intraday Forecast with Risk Analysis")
     pred_cols = st.columns(len(intraday_predictions))
     for i, pred in enumerate(intraday_predictions):
         with pred_cols[i]:
             change = ((pred['price'] / metrics['price']) - 1) * 100
             pred_cols[i].metric(
-                f"@ {pred['time']}", 
+                f"@ {pred['time_str']}", 
                 f"₹{pred['price']:,.2f}",
                 f"{change:+.2f}%",
                 delta_color="normal" if change > 0 else "inverse"
             )
-    st.caption(f"📊 Predictions update every {refresh_rate}s | Confidence: {st.session_state['model'].confidence_score:.0%}")
+            # Risk range display
+            pred_cols[i].caption(f"📊 Range: ₹{pred['lower']:,.2f} - ₹{pred['upper']:,.2f}")
+            pred_cols[i].caption(f"⚠️ Risk: ±{pred['risk_pct']:.1f}%")
+    
+    st.caption(f"🎯 Predictions update every {refresh_rate}s | Confidence: {st.session_state['model'].confidence_score:.0%}")
+    st.caption("💡 Shaded bands on chart show risk ranges - wider bands = higher uncertainty")
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown("---")
 
@@ -574,26 +600,83 @@ with g_col:
     
     if time_range == "1D":
         if not hist_intra.empty:
+            # Historical price line
             fig.add_trace(go.Scatter(
                 x=hist_intra.index, 
                 y=hist_intra['Close'], 
                 mode='lines', 
-                name='Price', 
-                line=dict(color='#00F0FF', width=2)
+                name='Actual Price', 
+                line=dict(color='#00F0FF', width=2.5),
+                hovertemplate='<b>Price:</b> ₹%{y:,.2f}<br><b>Time:</b> %{x}<extra></extra>'
             ))
             
-            # Add intraday predictions
+            # Add intraday predictions with risk bands
             if intraday_predictions:
-                pred_times = [now_ist + timedelta(minutes=5*i) for i in range(1, len(intraday_predictions)+1)]
+                pred_times = [p['time'] for p in intraday_predictions]
                 pred_prices = [p['price'] for p in intraday_predictions]
+                upper_band = [p['upper'] for p in intraday_predictions]
+                lower_band = [p['lower'] for p in intraday_predictions]
+                
+                # Connect current price to first prediction
+                pred_times_full = [hist_intra.index[-1]] + pred_times
+                pred_prices_full = [hist_intra['Close'].iloc[-1]] + pred_prices
+                upper_band_full = [hist_intra['Close'].iloc[-1]] + upper_band
+                lower_band_full = [hist_intra['Close'].iloc[-1]] + lower_band
+                
+                # Upper risk band (transparent fill)
                 fig.add_trace(go.Scatter(
-                    x=pred_times,
-                    y=pred_prices,
-                    mode='lines+markers',
-                    name='AI Forecast',
-                    line=dict(color='#FFA500', dash='dot', width=2),
-                    marker=dict(size=8)
+                    x=pred_times_full,
+                    y=upper_band_full,
+                    mode='lines',
+                    name='Upper Risk Band',
+                    line=dict(color='rgba(255,165,0,0)', width=0),
+                    showlegend=False,
+                    hoverinfo='skip'
                 ))
+                
+                # Lower risk band (with fill to upper)
+                fig.add_trace(go.Scatter(
+                    x=pred_times_full,
+                    y=lower_band_full,
+                    mode='lines',
+                    name='Risk Range',
+                    line=dict(color='rgba(255,165,0,0)', width=0),
+                    fill='tonexty',
+                    fillcolor='rgba(255,165,0,0.15)',
+                    hovertemplate='<b>Risk Range:</b> ₹%{y:,.2f}<extra></extra>'
+                ))
+                
+                # Main prediction line
+                fig.add_trace(go.Scatter(
+                    x=pred_times_full,
+                    y=pred_prices_full,
+                    mode='lines+markers',
+                    name='AI Prediction',
+                    line=dict(color='#FFA500', dash='dot', width=3),
+                    marker=dict(size=10, symbol='diamond', color='#FFA500',
+                               line=dict(color='white', width=1)),
+                    hovertemplate='<b>Predicted:</b> ₹%{y:,.2f}<br><b>Time:</b> %{x}<extra></extra>'
+                ))
+                
+                # Add annotation for latest prediction
+                last_pred = intraday_predictions[-1]
+                fig.add_annotation(
+                    x=last_pred['time'],
+                    y=last_pred['price'],
+                    text=f"₹{last_pred['price']:,.2f}<br>±{last_pred['risk_pct']:.1f}%",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=2,
+                    arrowcolor="#FFA500",
+                    ax=40,
+                    ay=-40,
+                    bgcolor="rgba(26,28,36,0.9)",
+                    bordercolor="#FFA500",
+                    borderwidth=2,
+                    borderpad=4,
+                    font=dict(size=11, color="white")
+                )
         else:
             st.warning("Intraday data hidden (Market Closed)")
     else:
