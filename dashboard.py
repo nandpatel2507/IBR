@@ -171,48 +171,52 @@ def extract_intraday_features(intraday_df, current_time_ist):
     if intraday_df.empty or len(intraday_df) < 2:
         return None
     
-    features = {}
-    close = intraday_df['Close'].values
-    volume = intraday_df['Volume'].values
-    high = intraday_df['High'].values
-    low = intraday_df['Low'].values
-    
-    # Price momentum
-    features['return_5m'] = (close[-1] / close[-2] - 1) * 100 if len(close) >= 2 else 0
-    features['return_30m'] = (close[-1] / close[-7] - 1) * 100 if len(close) >= 7 else 0
-    features['return_1h'] = (close[-1] / close[-13] - 1) * 100 if len(close) >= 13 else 0
-    
-    # Volatility (recent)
-    if len(close) >= 13:
-        returns_1h = np.diff(close[-13:]) / close[-14:-1]
-        features['volatility_1h'] = np.std(returns_1h) * 100
-    else:
-        features['volatility_1h'] = 0
-    
-    # Volume analysis
-    if len(volume) >= 13:
-        features['volume_ratio'] = volume[-1] / np.mean(volume[-13:]) if np.mean(volume[-13:]) > 0 else 1.0
-    else:
-        features['volume_ratio'] = 1.0
-    
-    # Price range
-    if len(high) >= 13 and len(low) >= 13:
-        recent_range = np.mean(high[-13:]) - np.mean(low[-13:])
-        features['range_position'] = (close[-1] - np.mean(low[-13:])) / recent_range if recent_range > 0 else 0.5
-    else:
-        features['range_position'] = 0.5
-    
-    # Time-based features
-    features['time_of_day'] = current_time_ist.hour + current_time_ist.minute / 60
-    features['minutes_into_session'] = (current_time_ist.hour - 9) * 60 + (current_time_ist.minute - 15)
-    
-    # Trend strength
-    if len(close) >= 13:
-        features['trend_strength'] = (close[-1] - close[-13]) / close[-13] * 100
-    else:
-        features['trend_strength'] = 0
-    
-    return features
+    try:
+        features = {}
+        close = intraday_df['Close'].values
+        volume = intraday_df['Volume'].values
+        high = intraday_df['High'].values
+        low = intraday_df['Low'].values
+        
+        # Price momentum
+        features['return_5m'] = (close[-1] / close[-2] - 1) * 100 if len(close) >= 2 else 0
+        features['return_30m'] = (close[-1] / close[-7] - 1) * 100 if len(close) >= 7 else 0
+        features['return_1h'] = (close[-1] / close[-13] - 1) * 100 if len(close) >= 13 else 0
+        
+        # Volatility (recent)
+        if len(close) >= 13:
+            returns_1h = np.diff(close[-13:]) / close[-14:-1]
+            features['volatility_1h'] = np.std(returns_1h) * 100
+        else:
+            features['volatility_1h'] = 0
+        
+        # Volume analysis
+        if len(volume) >= 13:
+            mean_vol = np.mean(volume[-13:])
+            features['volume_ratio'] = volume[-1] / mean_vol if mean_vol > 0 else 1.0
+        else:
+            features['volume_ratio'] = 1.0
+        
+        # Price range
+        if len(high) >= 13 and len(low) >= 13:
+            recent_range = np.mean(high[-13:]) - np.mean(low[-13:])
+            features['range_position'] = (close[-1] - np.mean(low[-13:])) / recent_range if recent_range > 0 else 0.5
+        else:
+            features['range_position'] = 0.5
+        
+        # Time-based features
+        features['time_of_day'] = current_time_ist.hour + current_time_ist.minute / 60
+        features['minutes_into_session'] = max(0, (current_time_ist.hour - 9) * 60 + (current_time_ist.minute - 15))
+        
+        # Trend strength
+        if len(close) >= 13:
+            features['trend_strength'] = (close[-1] - close[-13]) / close[-13] * 100
+        else:
+            features['trend_strength'] = 0
+        
+        return features
+    except Exception as e:
+        return None
 
 def extract_daily_features(hist_df, macro, sentiment_score):
     """Extract daily/historical features"""
@@ -292,21 +296,30 @@ class IntradayLearningModel:
         ist = pytz.timezone('Asia/Kolkata')
         
         for i in range(10, len(intraday_df_history)-1):
-            window = intraday_df_history.iloc[i-10:i]
-            current_time = window.index[-1].astimezone(ist)
-            
-            feats = extract_intraday_features(window, current_time)
-            if feats is None:
+            try:
+                window = intraday_df_history.iloc[i-10:i]
+                
+                # Handle timezone-aware/naive timestamps
+                timestamp = window.index[-1]
+                if timestamp.tzinfo is None:
+                    current_time = ist.localize(timestamp)
+                else:
+                    current_time = timestamp.astimezone(ist)
+                
+                feats = extract_intraday_features(window, current_time)
+                if feats is None:
+                    continue
+                
+                # Target: next 5-minute return
+                target = (intraday_df_history['Close'].iloc[i+1] / intraday_df_history['Close'].iloc[i] - 1) * 100
+                
+                row = [feats['return_5m'], feats['return_30m'], feats['return_1h'], 
+                       feats['volatility_1h'], feats['volume_ratio'], feats['range_position'],
+                       feats['time_of_day'], feats['minutes_into_session'], feats['trend_strength']]
+                X.append(row)
+                y.append(target)
+            except Exception as e:
                 continue
-            
-            # Target: next 5-minute return
-            target = (intraday_df_history['Close'].iloc[i+1] / intraday_df_history['Close'].iloc[i] - 1) * 100
-            
-            row = [feats['return_5m'], feats['return_30m'], feats['return_1h'], 
-                   feats['volatility_1h'], feats['volume_ratio'], feats['range_position'],
-                   feats['time_of_day'], feats['minutes_into_session'], feats['trend_strength']]
-            X.append(row)
-            y.append(target)
         
         if len(X) < 10:
             return False
@@ -318,7 +331,7 @@ class IntradayLearningModel:
             self.intraday_model.fit(X_scaled, y)
             self.intraday_ready = True
             return True
-        except:
+        except Exception as e:
             return False
     
     def predict_next_movement(self, daily_features, intraday_features=None):
@@ -457,13 +470,17 @@ now_ist = datetime.now(ist)
 
 if is_open and not hist_intra.empty and len(hist_intra) >= 20:
     # Retrain every 15 minutes with new data
-    if (st.session_state['last_intraday_train'] is None or 
-        (now_ist - st.session_state['last_intraday_train']).total_seconds() > 900):
-        
-        with st.spinner("📚 Learning from live patterns..."):
-            success = st.session_state['model'].train_intraday_model(hist_intra)
-            if success:
-                st.session_state['last_intraday_train'] = now_ist
+    try:
+        if (st.session_state['last_intraday_train'] is None or 
+            (now_ist - st.session_state['last_intraday_train']).total_seconds() > 900):
+            
+            with st.spinner("📚 Learning from live patterns..."):
+                success = st.session_state['model'].train_intraday_model(hist_intra)
+                if success:
+                    st.session_state['last_intraday_train'] = now_ist
+    except Exception as e:
+        # Silently continue if training fails
+        pass
 
 # --- GENERATE PREDICTIONS ---
 daily_feats = extract_daily_features(hist_max, macro, news_score)
